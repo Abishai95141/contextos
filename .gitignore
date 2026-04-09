@@ -7,3 +7,22 @@ dist/
 .turbo/
 out/
 coverage/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# uv
+uv.lock
+
+# Vitest
+coverage/
+
+# Biome
+.biome/
+
+# Turbo
+.turbo/

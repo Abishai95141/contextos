@@ -9,11 +9,32 @@ services:
       POSTGRES_PASSWORD: contextos_dev
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U contextos"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgres-test:
+    image: pgvector/pgvector:pg16
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: contextos_test
+      POSTGRES_USER: contextos
+      POSTGRES_PASSWORD: contextos_test
+    tmpfs:
+      - /var/lib/postgresql/data
 
 volumes:
   pgdata:

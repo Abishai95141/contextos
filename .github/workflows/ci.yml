@@ -6,11 +6,23 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+  TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+
 jobs:
-  build:
+  lint-typecheck:
+    name: Lint & Typecheck
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
           version: 9
@@ -19,5 +31,182 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
-      - run: pnpm build
+      - name: Lint
+        run: pnpm turbo run lint
+      - name: Typecheck
+        run: pnpm turbo run typecheck
+
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint-typecheck]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Run unit tests
+        run: pnpm turbo run test:unit
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: "**/coverage/"
+
+  test-integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint-typecheck]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: contextos_test
+          POSTGRES_USER: contextos
+          POSTGRES_PASSWORD: contextos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U contextos"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Run integration tests
+        run: pnpm turbo run test:integration
+        env:
+          DATABASE_URL: postgresql://contextos:contextos_test@localhost:5432/contextos_test
+          REDIS_URL: redis://localhost:6379
+
+  test-python:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint-typecheck]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: contextos_test
+          POSTGRES_USER: contextos
+          POSTGRES_PASSWORD: contextos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U contextos"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - name: Test NL Assembly
+        working-directory: services/nl-assembly
+        run: |
+          uv sync
+          uv run pytest tests/ -v --tb=short
+      - name: Test Semantic Diff
+        working-directory: services/semantic-diff
+        run: |
+          uv sync
+          uv run pytest tests/ -v --tb=short
+
+  test-e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [test-unit, test-integration, test-python]
+    if: github.ref == 'refs/heads/main'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: contextos_test
+          POSTGRES_USER: contextos
+          POSTGRES_PASSWORD: contextos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U contextos"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Run E2E tests
+        run: pnpm turbo run test:e2e
+        env:
+          DATABASE_URL: postgresql://contextos:contextos_test@localhost:5432/contextos_test
+          REDIS_URL: redis://localhost:6379
+
+  build-images:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [test-e2e]
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service: [mcp-server, hooks-bridge, web]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./apps/${{ matrix.service }}/Dockerfile
+          push: false
+          tags: contextos/${{ matrix.service }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
