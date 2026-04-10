@@ -39,6 +39,7 @@ services/
 docs/
   feature-packs/      # Feature Pack specs (spec.md, implementation.md, techstack.md per module)
   context-packs/      # Context Pack records from completed work
+  research/           # Research questions and verified answers (research_question.md, research_answers.md)
 ```
 
 ---
@@ -171,6 +172,7 @@ Modules MUST be implemented in order. Each module depends on the previous ones.
 1. Read `spec.md` — understand what you are building and why
 2. Read `implementation.md` — follow the step-by-step plan
 3. Read `techstack.md` — understand the technology choices
+4. Read `docs/research/research_answers.md` — verified API details for Drizzle, pgvector, Supabase, sentence-transformers, tree-sitter, FastAPI, Anthropic SDK, BullMQ, testcontainers, Biome, and Turborepo
 
 **"Complete" means:**
 - All code written and compiling (`pnpm typecheck` passes)
