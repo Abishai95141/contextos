@@ -116,12 +116,15 @@ A chronological timeline of all runs:
 
 ### Page 5: Policy Configuration (`/dashboard/[projectSlug]/policy`)
 
-Management interface for policy rules:
-- **Rules table**: shows all rules with priority order (drag-to-reorder), tool pattern, path pattern, decision badge
+Management interface for policy rules. The policy engine treats AI coding agents as **non-human identities (NHI)** — rules can be scoped per agent type.
+
+- **Rules table**: shows all rules with priority order (drag-to-reorder), tool pattern, path pattern, **agent type** badge (`claude_code`, `cursor`, `copilot`, or `*` for all), decision badge
 - **Edit in place**: click a rule → inline editor expands
-- **Test rule**: input a tool name + file path → shows which rule would match and what decision it returns (calls policy engine in dry-run mode)
+- **Agent type selector**: dropdown with values `claude_code`, `cursor`, `copilot`, `*` (wildcard). Defaults to `*`.
+- **Test rule**: input a tool name + file path + **agent type** → shows which rule would match and what decision it returns (calls policy engine in dry-run mode)
 - **Priority drag-and-drop**: reorder rules by dragging; updates priority integers on save
-- **New rule form**: modal with all fields; validation feedback inline
+- **New rule form**: modal with all fields including agent type; validation feedback inline
+- **Audit log**: expandable section showing recent `policy_decisions` for the project — who (which agent) requested what, and what decision was made
 
 **Client Component** — full interactivity required.
 
@@ -129,8 +132,10 @@ Management interface for policy rules:
 
 Project configuration:
 - **Project details**: name, slug (readonly after creation), repo URL
-- **Hook configuration**: shows the generated `.claude/settings.json` snippet with copy button
+- **Claude Code hook configuration**: shows the generated `.claude/settings.json` snippet with copy button
+- **Cursor hook configuration**: shows the generated `.cursor/hooks.json` snippet and the `contextos.sh` adapter script with copy buttons. Includes a note explaining the stdin/stdout adapter pattern.
 - **Token management**: generate/revoke Clerk M2M tokens for the project
+- **Sync settings**: toggle cloud sync on/off, view last sync timestamp, force push/pull
 - **Danger zone**: delete project (requires typing project name to confirm)
 
 ---
@@ -286,3 +291,36 @@ For active runs, the run timeline page displays a live event counter. Implementa
 - On run completion: SSE sends a `status: 'completed'` event; Client Component removes the live indicator
 
 This is simpler than WebSockets for this use case (one-directional push from server to client) and requires no additional infrastructure (no Socket.io server, no Pusher, no Ably).
+
+---
+
+## 6. Sync API for VS Code Extension
+
+The VS Code extension uses a local SQLite primary store. These endpoints enable bidirectional sync between the local store and cloud PostgreSQL.
+
+### `POST /api/sync/push`
+
+Receives locally-created records (runs, run events, context packs) from the VS Code extension and inserts them into cloud PostgreSQL. Uses `ON CONFLICT DO NOTHING` for idempotency.
+
+```typescript
+const PushPayloadSchema = z.object({
+  runs: z.array(RunSchema).optional(),
+  runEvents: z.array(RunEventSchema).optional(),
+  contextPacks: z.array(ContextPackSchema).optional(),
+});
+```
+
+Returns: `{ pushed: { runs: number, runEvents: number, contextPacks: number } }`
+
+### `POST /api/sync/pull`
+
+Returns records the extension doesn't have yet. The extension sends its latest `sync_state` cursor (timestamp of last pull), and the server returns all records newer than that cursor.
+
+```typescript
+const PullRequestSchema = z.object({
+  since: z.string().datetime(),  // ISO 8601 timestamp of last pull
+  projectId: z.string().uuid(),
+});
+```
+
+Returns: `{ projects: [...], featurePacks: [...], runs: [...], syncCursor: "2026-01-20T12:00:00Z" }`

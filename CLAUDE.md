@@ -12,9 +12,9 @@ The system has five layers:
 
 ```
 Layer 0: Agent Entry Points     → Claude Code, Cursor, VS Code + Copilot
-Layer 1: Integration Protocol   → MCP Server (universal), Hooks Bridge (Claude Code), Context Files (fallback)
+Layer 1: Integration Protocol   → MCP Server (universal), Hooks Bridge (Claude Code + Cursor), Context Files (fallback)
 Layer 2: Core Services          → Pack Service, Context Pack Service, Policy Engine, NL Assembly, Run Recorder, Semantic Diff
-Layer 3: Storage                → PostgreSQL + pgvector, Append-only Event Store, Redis, Local SQLite Cache
+Layer 3: Storage                → Local SQLite Primary Store (sqlite-vec), PostgreSQL + pgvector (cloud sync), Redis
 Layer 4: Clients                → VS Code Extension, Web App, CLI (future)
 ```
 
@@ -27,7 +27,7 @@ Layer 4: Clients                → VS Code Extension, Web App, CLI (future)
 ```
 apps/
   mcp-server/         # MCP Server — TypeScript, @modelcontextprotocol/sdk, Streamable HTTP
-  hooks-bridge/       # Claude Code HTTP Hooks Bridge — TypeScript, Hono
+  hooks-bridge/       # Claude Code + Cursor HTTP Hooks Bridge — TypeScript, Hono
   web/                # Web App — Next.js 15, React 19
   vscode/             # VS Code Extension
 packages/
@@ -35,7 +35,7 @@ packages/
   shared/             # Shared types, Zod schemas, utilities
 services/
   nl-assembly/        # NL Assembly — Python, FastAPI, sentence-transformers, pgvector
-  semantic-diff/      # Semantic Diff — Python, FastAPI, tree-sitter, Anthropic Claude
+  semantic-diff/      # Semantic Diff — Python, FastAPI, tree-sitter (sync AST), Anthropic Claude (async enrichment)
 docs/
   feature-packs/      # Feature Pack specs (spec.md, implementation.md, techstack.md per module)
   context-packs/      # Context Pack records from completed work
@@ -304,6 +304,18 @@ Embedding generation and semantic diff are async, CPU-bound tasks. BullMQ provid
 
 ### ADR-007: Append-Only Event Store for Context Packs
 Context Packs and Run Events are immutable — they are historical records. The append-only constraint prevents accidental data loss and enables event sourcing. Implemented via PostgreSQL with no UPDATE/DELETE permissions on these tables.
+
+### ADR-008: Local-First SQLite as Primary Store
+The VS Code extension uses SQLite (`better-sqlite3` + `sqlite-vec`) as the **primary store**, not a cache. Runs, run events, and context packs are written locally first. Cloud PostgreSQL is the team-sync layer — optional for individual developer use. This eliminates the #1 enterprise blocker (data leaving dev machines) and guarantees sub-millisecond reads with zero network dependency.
+
+### ADR-009: Cursor Hook Adapter
+Cursor hooks are command-based (stdin/stdout JSON) while Claude Code supports HTTP hooks. ContextOS uses a single adapter script (`.cursor/hooks/contextos.sh`) that reads Cursor's JSON from stdin, normalizes field names (e.g., `conversation_id` → `session_id`), POSTs to the hooks-bridge, and translates the response back to Cursor's stdout format. Same semantics, different transport. See `docs/SYSTEM-DESIGN.md` Section 15 for full adapter specification.
+
+### ADR-010: Graphify Import for Cold-Start
+Graphify (`safishamsi/graphify`, MIT license) produces a `graph.json` with tree-sitter AST nodes clustered by Leiden community detection. ContextOS imports this output to seed initial Feature Pack content — each community becomes a Feature Pack section. This solves the cold-start problem (first session runs without context) without requiring manual Feature Pack authoring.
+
+### ADR-011: Policy Engine as Non-Human Identity (NHI) Infrastructure
+The policy engine treats AI coding agents as distinct non-human identities. Policy rules include an `agent_type` field (values: `claude_code`, `cursor`, `copilot`, `*`) enabling per-agent permission scoping. Combined with the `policy_decisions` audit table, this positions ContextOS as enterprise access governance for AI agents — not just a context injection tool.
 
 ---
 

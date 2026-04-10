@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-Module 01 (Foundation) complete. `uv` installed. `ANTHROPIC_API_KEY` set in `.env`.
+Module 01 (Foundation) complete. `uv` installed. `ANTHROPIC_API_KEY` in `.env` is **optional** — without it the service runs in AST-only mode (no LLM enrichment).
 
 ---
 
@@ -99,7 +99,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
 
-    anthropic_api_key: str
+    anthropic_api_key: str | None = None  # Optional — AST-only mode if absent
     redis_url: RedisDsn
     semantic_diff_model: str = 'claude-3-5-haiku-20241022'
     max_diff_tokens: int = 8000
@@ -492,20 +492,22 @@ class DiffPipeline:
         self.cache = cache
 
     async def analyze(self, request: AnalyzeRequest) -> AnalysisOutput:
-        """Run the full analysis pipeline for a diff.
+        """Run the AST-only analysis pipeline for a diff.
 
         Pipeline:
         1. Check cache for identical diff
         2. Run AST analysis on all changed files
-        3. Call LLM for natural language summarization
-        4. Cache the result
-        5. Return structured output
+        3. Return AST-only result with enrichment_status='pending'
+
+        LLM enrichment runs asynchronously via a separate BullMQ worker
+        that calls the /enrich endpoint. The /analyze endpoint NEVER
+        calls the Anthropic API directly.
 
         Args:
             request: AnalyzeRequest with raw_diff and changed_files.
 
         Returns:
-            AnalysisOutput with complete analysis.
+            AnalysisOutput with AST analysis (LLM fields null until enriched).
         """
         # Step 1: Cache check
         cache_key = hashlib.sha256(request.raw_diff.encode()).hexdigest()
@@ -552,33 +554,32 @@ class DiffPipeline:
             ],
         }
 
-        # Step 3: LLM analysis
-        llm_result = await self.llm_client.analyze(
-            raw_diff=request.raw_diff,
-            ast_diff_json=json.dumps(ast_summary, indent=2),
-            feature_pack_description=request.feature_pack_description or '',
-        )
+        # Step 3: Return AST-only result (LLM enrichment happens async via BullMQ worker)
+        enrichment_status = 'pending'
+        settings = get_settings()
+        if not settings.anthropic_api_key:
+            enrichment_status = 'skipped'
 
-        # Step 4: Build output
         output = AnalysisOutput(
             run_id=request.run_id,
-            summary=llm_result.summary,
-            apis_added=llm_result.apis_added,
-            apis_removed=llm_result.apis_removed,
-            tests_added=llm_result.tests_added,
-            tests_broken=llm_result.tests_broken,
-            new_modules=llm_result.new_modules,
-            breaking_changes=llm_result.breaking_changes,
-            key_decisions=llm_result.key_decisions,
+            summary=None,  # Populated by async enrichment
+            apis_added=[api for d in file_diffs for api in d.apis_added],
+            apis_removed=[api for d in file_diffs for api in d.apis_removed],
+            tests_added=[t for d in file_diffs for t in d.tests_added],
+            tests_broken=[t for d in file_diffs for t in d.tests_broken],
+            new_modules=[d.file_path for d in file_diffs if d.new_module],
+            breaking_changes=[],  # Populated by async enrichment
+            key_decisions=[],  # Populated by async enrichment
             files_analyzed=len(file_diffs),
-            model_used=llm_result.model_used,
-            input_tokens=llm_result.input_tokens,
-            output_tokens=llm_result.output_tokens,
+            enrichment_status=enrichment_status,
+            model_used=None,
+            input_tokens=None,
+            output_tokens=None,
             cached=False,
             analyzed_at=datetime.now(timezone.utc).isoformat(),
         )
 
-        # Step 5: Cache the result
+        # Step 4: Cache the AST result
         await self.cache.set(cache_key, output.model_dump_json())
 
         return output
@@ -792,8 +793,10 @@ async def test_pipeline_returns_cached_result(mock_llm, mock_cache) -> None:
 - [ ] `uv sync` completes
 - [ ] `uv run pytest tests/ -v` passes all tests
 - [ ] `uv run uvicorn semantic_diff.main:app --port 8002` starts
-- [ ] `GET /health` returns `200 { "status": "healthy" }`
-- [ ] `POST /analyze` with a simple TypeScript diff returns a structured response
+- [ ] `GET /health` returns `200 { "status": "healthy", "enrichment_enabled": true/false }`
+- [ ] `POST /analyze` with a simple TypeScript diff returns AST-only result with `enrichment_status: "pending"` (or `"skipped"` if no API key)
+- [ ] `POST /analyze` succeeds even without `ANTHROPIC_API_KEY` configured (AST-only mode)
 - [ ] Repeated `/analyze` with the same diff uses the cache (check `cached: true`)
+- [ ] `POST /enrich` with an analysis ID triggers LLM enrichment (when `ANTHROPIC_API_KEY` is set)
 - [ ] `ruff check src/` passes with no errors
 - [ ] Fixture-based tests in `tests/test_diff_pipeline.py` all pass

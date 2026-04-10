@@ -174,6 +174,7 @@ export const policyRules = pgTable(
     toolPattern: text('tool_pattern').notNull(), // glob, e.g. "Bash", "Write*", "*"
     pathPattern: text('path_pattern'), // glob, e.g. "**/node_modules/**" — nullable
     decision: text('decision').notNull(), // allow | deny | warn
+    agentType: text('agent_type').notNull().default('*'), // claude_code | cursor | copilot | * (wildcard) — NHI identity scoping
     priority: integer('priority').notNull().default(100), // lower = higher priority
     isActive: boolean('is_active').notNull().default(true),
     metadata: jsonb('metadata'), // extra conditions or annotations
@@ -196,6 +197,7 @@ export const policyDecisions = pgTable(
     runId: uuid('run_id').references(() => runs.id),
     sessionId: text('session_id'), // for hook traces before a run is created
     toolName: text('tool_name').notNull(),
+    agentType: text('agent_type'), // claude_code | cursor | copilot — which agent made the request
     decision: text('decision').notNull(), // allow | deny | warn
     reason: text('reason'),
     idempotencyKey: text('idempotency_key').notNull().unique(),

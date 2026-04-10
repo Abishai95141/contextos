@@ -417,7 +417,13 @@ export async function evaluatePolicy(input: PolicyEvalInput): Promise<PolicyEval
   // Extract file path from tool input (tool-specific)
   const filePath = extractFilePath(toolName, toolInput);
 
+  // Determine agent type from request context (Cursor adapter sets this; Claude Code defaults)
+  const agentType = (toolInput as Record<string, unknown>).agent_type ?? 'claude_code';
+
   for (const rule of rules) {
+    // Agent type filter
+    if (rule.agentType && rule.agentType !== '*' && rule.agentType !== agentType) continue;
+
     // Event type filter
     if (rule.eventType !== '*' && rule.eventType !== eventType) continue;
 
@@ -442,7 +448,10 @@ export async function evaluatePolicy(input: PolicyEvalInput): Promise<PolicyEval
 }
 
 function extractFilePath(toolName: string, toolInput: Record<string, unknown>): string | null {
-  // Claude Code tools that have file paths
+  // Both Claude Code and Cursor use the same tool names for file operations.
+  // Cursor's preToolUse fires with tool_name values: Shell, Read, Write, Grep, Delete, Task
+  // Cursor's beforeMCPExecution uses MCP:<tool_name> format
+  // Claude Code uses: Edit, Write, Read, MultiEdit, Bash
   const pathFields: Record<string, string> = {
     Edit: 'file_path',
     Write: 'file_path',
@@ -451,7 +460,14 @@ function extractFilePath(toolName: string, toolInput: Record<string, unknown>): 
   };
 
   const field = pathFields[toolName];
-  if (!field) return null;
+  if (!field) {
+    // Fallback: check common path fields for unknown tool names
+    for (const candidate of ['file_path', 'path', 'filePath']) {
+      const value = toolInput[candidate];
+      if (typeof value === 'string') return value;
+    }
+    return null;
+  }
 
   const value = toolInput[field];
   return typeof value === 'string' ? value : null;

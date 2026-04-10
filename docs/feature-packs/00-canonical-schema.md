@@ -89,7 +89,7 @@ Immutable record of what an AI agent built during a run. Never updated or delete
 | `feature_pack_id` | uuid | nullable, FK → feature_packs | |
 | `feature_pack_version` | integer | nullable | Snapshot of version at creation |
 | `content` | jsonb | NOT NULL | `ContextPackContent` (tool traces, decisions, files) |
-| `semantic_diff` | jsonb | nullable | `SemanticDiff` — written by semantic-diff service |
+| `semantic_diff` | jsonb | nullable | `SemanticDiff` — written by semantic-diff service. Includes `enrichment_status` field: `pending` \| `complete` \| `failed` \| `skipped`. AST fields always populated; LLM fields nullable. |
 | `summary` | text | nullable | Human-readable summary |
 | `summary_embedding` | vector(384) | nullable | all-MiniLM-L6-v2 embedding. **384 dims, not 1536.** |
 | `status` | text | NOT NULL, DEFAULT `'committed'` | `committed` \| `partial` \| `quarantined` |
@@ -156,6 +156,7 @@ Individual rules within a policy. Evaluated in priority order (ascending). First
 | `event_type` | text | NOT NULL | `PreToolUse` \| `PostToolUse` \| `PermissionRequest` \| `*` |
 | `tool_pattern` | text | NOT NULL | Glob, e.g. `"Bash"`, `"Write*"`, `"*"` |
 | `path_pattern` | text | nullable | Glob on `toolInput.file_path`, e.g. `"**/node_modules/**"` |
+| `agent_type` | text | NOT NULL, DEFAULT `'*'` | `claude_code` \| `cursor` \| `copilot` \| `*` (wildcard). NHI identity scoping. |
 | `decision` | text | NOT NULL | `allow` \| `deny` \| `warn` |
 | `priority` | integer | NOT NULL, DEFAULT 100 | Lower number = evaluated first |
 | `is_active` | boolean | NOT NULL, DEFAULT true | |
@@ -178,6 +179,7 @@ Immutable record of every policy evaluation. Never updated or deleted.
 | `run_id` | uuid | nullable, FK → runs | Present if evaluation happens within a run |
 | `session_id` | text | nullable | Present for hook evaluations before a run is created |
 | `tool_name` | text | NOT NULL | |
+| `agent_type` | text | nullable | `claude_code` \| `cursor` \| `copilot` — which agent made the request |
 | `decision` | text | NOT NULL | `allow` \| `deny` \| `warn` |
 | `reason` | text | nullable | Rule name or "default allow" |
 | `idempotency_key` | text | NOT NULL, UNIQUE | `pd:{sessionId}:{toolName}:{eventType}` — prevents duplicates on retry |
@@ -212,7 +214,7 @@ Each module number corresponds to `docs/feature-packs/NN-name/`.
 | **04 Web App** | Read-only queries across all tables. **No new DB tables.** |
 | **05 NL Assembly** | Reads `context_packs.summary`. Writes `context_packs.summary_embedding`. HNSW index already in `0000_initial.sql`. **No new DB tables.** |
 | **06 Semantic Diff** | Writes `context_packs.semantic_diff`. **No new DB tables.** |
-| **07 VS Code Extension** | MCP client only. No direct DB access. **No new DB tables.** |
+| **07 VS Code Extension** | Uses **local SQLite as primary store** (better-sqlite3 + sqlite-vec). No direct cloud DB access. Syncs to/from cloud PostgreSQL via Web App sync API. |
 
 ---
 

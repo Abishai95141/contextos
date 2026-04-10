@@ -136,7 +136,7 @@ Each module has detailed specs in `docs/feature-packs/`:
 | [04 — Web App](docs/feature-packs/04-web-app/) | Pack editor, archive, run history, dashboard | Spec ready |
 | [05 — NL Assembly](docs/feature-packs/05-nl-assembly/) | Embeddings, semantic search, pgvector | Spec ready |
 | [06 — Semantic Diff](docs/feature-packs/06-semantic-diff/) | AST parsing, LLM summarization | Spec ready |
-| [07 — VS Code Extension](docs/feature-packs/07-vscode-extension/) | Commands, SQLite cache, offline support | Spec ready |
+| [07 — VS Code Extension](docs/feature-packs/07-vscode-extension/) | Commands, SQLite primary store, offline support | Spec ready |
 
 ## AI Agent Instructions
 

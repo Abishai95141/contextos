@@ -201,7 +201,7 @@ CREATE INDEX run_events_run_id_seq_idx ON run_events (run_id, sequence_num);
 
 ### Table 6: `policy_rules`
 
-Policy rules define what an AI agent is and is not allowed to do within a project.
+Policy rules define what an AI agent is and is not allowed to do within a project. Rules include an `agent_type` field for per-agent identity scoping (NHI infrastructure).
 
 ```sql
 CREATE TABLE policy_rules (
@@ -213,6 +213,8 @@ CREATE TABLE policy_rules (
                   CHECK (event_type IN ('PreToolUse', 'PostToolUse', 'PermissionRequest', '*')),
   tool_pattern    TEXT,              -- Glob or regex pattern matching tool_name
   path_pattern    TEXT,              -- Glob pattern for file paths
+  agent_type      TEXT NOT NULL DEFAULT '*'
+                  CHECK (agent_type IN ('claude_code', 'cursor', 'copilot', '*')),
   decision        TEXT NOT NULL
                   CHECK (decision IN ('allow', 'deny', 'warn')),
   priority        INTEGER NOT NULL DEFAULT 100,  -- Lower number = higher priority
@@ -229,23 +231,27 @@ CREATE INDEX policy_rules_priority_idx ON policy_rules (project_id, priority ASC
 
 ### Table 7: `semantic_diffs`
 
-Stores the output of the Semantic Diff service — structured analysis of what changed in a run.
+Stores the output of the Semantic Diff service. The sync `/analyze` endpoint populates AST fields immediately. LLM enrichment fields are populated asynchronously by the BullMQ enrichment worker.
 
 ```sql
 CREATE TABLE semantic_diffs (
-  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  run_id          UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-  raw_diff        TEXT NOT NULL,           -- The raw git diff
-  apis_added      JSONB NOT NULL DEFAULT '[]',
-  apis_removed    JSONB NOT NULL DEFAULT '[]',
-  tests_added     JSONB NOT NULL DEFAULT '[]',
-  tests_broken    JSONB NOT NULL DEFAULT '[]',
-  new_modules     JSONB NOT NULL DEFAULT '[]',
-  summary         TEXT NOT NULL,           -- LLM-generated natural language summary
-  model_used      TEXT NOT NULL,           -- e.g. 'claude-3-5-haiku-20241022'
-  input_tokens    INTEGER,
-  output_tokens   INTEGER,
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id            UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  raw_diff          TEXT NOT NULL,           -- The raw git diff
+  apis_added        JSONB NOT NULL DEFAULT '[]',
+  apis_removed      JSONB NOT NULL DEFAULT '[]',
+  tests_added       JSONB NOT NULL DEFAULT '[]',
+  tests_broken      JSONB NOT NULL DEFAULT '[]',
+  new_modules       JSONB NOT NULL DEFAULT '[]',
+  enrichment_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (enrichment_status IN ('pending', 'complete', 'failed', 'skipped')),
+  summary           TEXT,                    -- LLM-generated summary (null until enrichment completes)
+  breaking_changes  JSONB DEFAULT '[]',      -- LLM-identified (null until enrichment)
+  key_decisions     JSONB DEFAULT '[]',      -- LLM-identified (null until enrichment)
+  model_used        TEXT,                    -- e.g. 'claude-3-5-haiku-20241022' (null if not enriched)
+  input_tokens      INTEGER,
+  output_tokens     INTEGER,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX semantic_diffs_run_id_idx ON semantic_diffs (run_id);
 ```
@@ -303,7 +309,7 @@ NL_ASSEMBLY_EMBEDDING_MODEL=all-MiniLM-L6-v2
 
 # Semantic Diff Service
 SEMANTIC_DIFF_URL=http://localhost:3201
-ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_API_KEY=sk-ant-...    # Optional — without it, Semantic Diff runs in AST-only mode (no LLM enrichment)
 SEMANTIC_DIFF_MODEL=claude-3-5-haiku-20241022
 
 # MCP Server
@@ -337,7 +343,7 @@ export const EnvSchema = z.object({
   CLERK_PUBLISHABLE_KEY: z.string().min(1),
   NL_ASSEMBLY_URL: z.string().url(),
   SEMANTIC_DIFF_URL: z.string().url(),
-  ANTHROPIC_API_KEY: z.string().min(1),
+  ANTHROPIC_API_KEY: z.string().min(1).optional(),  // Optional — AST-only mode if absent
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
   MCP_SERVER_PORT: z.coerce.number().int().positive().default(3100),
   HOOKS_BRIDGE_PORT: z.coerce.number().int().positive().default(3101),

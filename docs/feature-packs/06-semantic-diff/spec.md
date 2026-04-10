@@ -2,7 +2,13 @@
 
 ## Overview
 
-The Semantic Diff service analyzes code changes made during a Claude Code run and produces a structured, human-readable summary. It combines AST-level parsing (via tree-sitter) with LLM-based natural language summarization (via Anthropic Claude) to produce output that tells developers exactly what changed, at the semantic level — not just which lines changed.
+The Semantic Diff service analyzes code changes made during an AI coding agent run using a **two-phase architecture**:
+
+1. **Synchronous AST-only structural diff** (200–500ms) — tree-sitter parses changed files, computes structural diffs (functions added/removed, tests added/broken, new modules). This runs in the HTTP request path and returns immediately. No external API dependency.
+
+2. **Asynchronous LLM enrichment** (seconds, background) — A BullMQ worker sends the AST diff + raw diff to Anthropic Claude for natural language summarization. This updates the `semantic_diffs` record in the background. Optional — the system works without it.
+
+This split ensures context pack assembly never blocks on an LLM API call, works fully offline, and still provides rich semantic understanding when the Anthropic API is available.
 
 ---
 
@@ -11,39 +17,43 @@ The Semantic Diff service analyzes code changes made during a Claude Code run an
 ```
 Caller: Hooks Bridge (Stop hook → context pack assembly worker)
          │
-         │  HTTP POST /analyze
+         │  HTTP POST /analyze  (synchronous, AST-only)
          ▼
 ┌─────────────────────────────────────────────────────┐
 │             Semantic Diff Service (FastAPI)          │
 │                                                      │
-│  POST /analyze   → Full diff analysis pipeline       │
+│  POST /analyze   → AST-only structural diff (sync)   │
+│  POST /enrich    → LLM summarization (async worker)   │
 │  GET  /health    → Health check                      │
 │                                                      │
 │  ┌──────────────────────────────────────────────┐    │
-│  │           AST Parsing Layer                  │    │
+│  │     SYNC PATH: AST Parsing Layer (200-500ms) │    │
 │  │  - tree-sitter parsing for each changed file │    │
 │  │  - Extracts: function sigs, class defs,      │    │
 │  │              exports, test names              │    │
 │  │  - Computes structural diff between old/new  │    │
+│  │  - Returns immediately, no external API calls │    │
 │  └──────────────────────────────────────────────┘    │
 │                                                      │
 │  ┌──────────────────────────────────────────────┐    │
-│  │           LLM Summarization Layer            │    │
-│  │  - Anthropic Claude API                      │    │
-│  │  - Structured prompt with diff + AST context │    │
-│  │  - Returns: JSON with summary + categorized  │    │
-│  │    changes                                   │    │
+│  │     ASYNC PATH: LLM Enrichment (background)  │    │
+│  │  - Triggered by BullMQ job after /analyze     │    │
+│  │  - Anthropic Claude API (Haiku)               │    │
+│  │  - Structured prompt with diff + AST context  │    │
+│  │  - Updates semantic_diffs record when done     │    │
+│  │  - Optional: skipped if ANTHROPIC_API_KEY      │    │
+│  │    not configured                              │    │
 │  └──────────────────────────────────────────────┘    │
 │                                                      │
 │  ┌──────────────────────────────────────────────┐    │
 │  │           Cache Layer                        │    │
 │  │  - SHA-256 hash of raw_diff as cache key     │    │
 │  │  - Redis: TTL 24h                            │    │
-│  │  - Skip LLM for identical diffs              │    │
+│  │  - Skip LLM enrichment for identical diffs   │    │
 │  └──────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────┘
-         │
-    Redis (cache)
+         │                        │
+    Redis (cache)           BullMQ (enrichment queue)
 ```
 
 ---
@@ -103,24 +113,27 @@ class FileDiff:
 
 ### Handling Files Without AST Support
 
-For unsupported file extensions (`.json`, `.yaml`, `.md`, `.sql`), the service reports the file as changed but skips AST analysis. The LLM prompt includes the raw diff for these files.
+For unsupported file extensions (`.json`, `.yaml`, `.md`, `.sql`), the service reports the file as changed but skips AST analysis. The raw diff for these files is included in the LLM enrichment prompt (async path).
 
 ---
 
-## 3. LLM-Based Diff Summarization
+## 3. Async LLM Enrichment
 
-### Why LLM for Summarization
+### Why LLM as a Separate Phase
 
-Pure AST diff can tell you "function `handleOAuthCallback` was added". It cannot tell you "the OAuth callback now validates the state parameter to prevent CSRF attacks". The semantic meaning of the change — the *why* and *what it does* — requires understanding the code's logic.
+The `/analyze` endpoint returns AST-only structural data synchronously (200–500ms). This is sufficient for context pack assembly — the context pack records what functions were added/removed, what tests changed, and what new modules appeared.
 
-The LLM receives:
-1. The raw git diff (limited to 8,000 tokens to manage cost)
-2. The structured AST diff output
-3. The project's Feature Pack context (conventions, architecture description)
+The LLM enrichment adds *semantic understanding* asynchronously: it explains *why* a change was made, *what* it accomplishes, and whether it introduces breaking changes that aren't syntactically obvious. This runs as a background BullMQ job that updates the `semantic_diffs` record after the context pack is already saved.
 
-It returns a structured JSON response with a natural language summary and categorized change descriptions.
+**This split exists because:**
+- Context pack assembly must not block on an external API call
+- The system must work fully offline (no Anthropic API key required)
+- LLM enrichment is a nice-to-have, not a requirement for a usable context pack
+- Enterprise users may prohibit sending code to external APIs
 
-### Prompt Design
+### LLM Enrichment Prompt
+
+The BullMQ enrichment worker sends the following to the LLM:
 
 ```
 System: You are a senior software engineer analyzing code changes made by an AI coding agent.
@@ -159,30 +172,34 @@ Return a JSON object with this exact structure:
 - If diff exceeds limit: the largest files' diffs are truncated first; small files are preserved in full
 - The AST diff (structured, compact) is always included in full regardless of size
 - Model: `claude-3-5-haiku-20241022` (fast, cost-effective for this structured extraction task)
+- **This model is used only in the async enrichment worker, never in the sync `/analyze` path**
 
 ---
 
 ## 4. Output Structure
 
-The `/analyze` endpoint returns:
+The `/analyze` endpoint returns the **AST-only structural diff** synchronously. LLM-enriched fields are populated asynchronously by the enrichment worker.
 
 ```typescript
 interface AnalysisOutput {
   run_id: string;
-  summary: string;                    // LLM-generated 2-3 sentence summary
-  apis_added: string[];               // New public APIs
-  apis_removed: string[];             // Removed APIs (breaking change risk)
-  tests_added: string[];              // New test coverage
-  tests_broken: string[];             // Test regressions
-  new_modules: string[];              // New files/modules
-  breaking_changes: string[];         // Backward-incompatible changes
-  key_decisions: string[];            // Notable decisions visible in code
+  enrichment_status: 'pending' | 'complete' | 'failed' | 'skipped'; // pending = AST-only, complete = LLM enriched, failed = LLM error after retries, skipped = no API key
+  // AST-only fields (always populated by /analyze):
+  apis_added: string[];               // New public APIs (from AST)
+  apis_removed: string[];             // Removed APIs (from AST)
+  tests_added: string[];              // New test coverage (from AST)
+  tests_broken: string[];             // Test regressions (from AST)
+  new_modules: string[];              // New files/modules (from AST)
   files_analyzed: number;             // Count of files in the diff
-  model_used: string;                 // e.g., 'claude-3-5-haiku-20241022'
-  input_tokens: number;
-  output_tokens: number;
-  cached: boolean;                    // True if result came from cache
   analyzed_at: string;                // ISO timestamp
+  // LLM-enriched fields (populated async, null until enrichment completes):
+  summary: string | null;             // LLM-generated 2-3 sentence summary
+  breaking_changes: string[] | null;  // Backward-incompatible changes (requires semantic understanding)
+  key_decisions: string[] | null;     // Notable decisions visible in code
+  model_used: string | null;          // e.g., 'claude-3-5-haiku-20241022'
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached: boolean;                    // True if LLM result came from cache
 }
 ```
 
@@ -192,7 +209,7 @@ This output is stored in `semantic_diffs` table and included in the generated Co
 
 ## 5. API Endpoints
 
-### POST /analyze
+### POST /analyze (synchronous, AST-only)
 
 **Request**:
 ```json
@@ -216,25 +233,59 @@ This output is stored in `semantic_diffs` table and included in the generated Co
 ```json
 {
   "run_id": "uuid",
-  "summary": "Added Google OAuth callback handler with CSRF state validation...",
+  "enrichment_status": "pending",
   "apis_added": ["handleGoogleCallback(code: string, state: string): Promise<User>"],
   "apis_removed": [],
   "tests_added": ["test_google_callback_validates_state", "test_google_callback_exchanges_code"],
   "tests_broken": [],
   "new_modules": [],
-  "breaking_changes": [],
-  "key_decisions": ["Using jose library for JWT verification instead of jsonwebtoken"],
   "files_analyzed": 2,
-  "model_used": "claude-3-5-haiku-20241022",
-  "input_tokens": 1842,
-  "output_tokens": 423,
-  "cached": false,
-  "analyzed_at": "2026-01-20T10:00:00Z"
+  "analyzed_at": "2026-01-20T10:00:00Z",
+  "summary": null,
+  "breaking_changes": null,
+  "key_decisions": null,
+  "model_used": null,
+  "input_tokens": null,
+  "output_tokens": null,
+  "cached": false
 }
 ```
 
+`enrichment_status` is `pending` (LLM enrichment queued), `skipped` (no `ANTHROPIC_API_KEY`), or `complete` (cache hit from prior enrichment of identical diff).
+
 **Error** (422): Pydantic validation errors for missing or invalid fields.
-**Error** (503): Anthropic API unavailable.
+
+> **Note:** This endpoint never returns 503 for Anthropic API issues — the LLM is not in the request path.
+
+### POST /enrich (called by BullMQ worker, not by external clients)
+
+The enrichment worker calls this endpoint (or invokes the function directly) to run LLM summarization on a previously-analyzed diff.
+
+**Request**:
+```json
+{
+  "run_id": "uuid",
+  "raw_diff": "...",
+  "ast_diff": { "...AST output from /analyze..." },
+  "feature_pack_description": "Authentication module handling OAuth flows"
+}
+```
+
+**Response** (200 OK):
+```json
+{
+  "run_id": "uuid",
+  "enrichment_status": "complete",
+  "summary": "Added Google OAuth callback handler with CSRF state validation...",
+  "breaking_changes": [],
+  "key_decisions": ["Using jose library for JWT verification instead of jsonwebtoken"],
+  "model_used": "claude-3-5-haiku-20241022",
+  "input_tokens": 1842,
+  "output_tokens": 423
+}
+```
+
+**Error** (503): Anthropic API unavailable. Worker retries with exponential backoff.
 
 ### GET /health
 
@@ -242,10 +293,13 @@ This output is stored in `semantic_diffs` table and included in the generated Co
 {
   "status": "healthy",
   "anthropic_api": "reachable",
+  "enrichment_enabled": true,
   "cache": "healthy",
   "timestamp": "2026-01-20T10:00:00Z"
 }
 ```
+
+`enrichment_enabled` is `true` if `ANTHROPIC_API_KEY` is configured, `false` otherwise. When `false`, the service operates in AST-only mode and `anthropic_api` is reported as `"not_configured"`. This is a valid operating state, not an error.
 
 ---
 
@@ -254,9 +308,13 @@ This output is stored in `semantic_diffs` table and included in the generated Co
 To avoid paying for LLM calls on identical diffs (e.g., re-analyzing the same run):
 
 **Cache key**: `SHA-256(raw_diff)`
-**Cache value**: Full JSON response from the LLM
+**Cache value**: Full JSON response from the LLM enrichment
 **Cache backend**: Redis
 **TTL**: 86,400 seconds (24 hours)
+
+The cache is checked in two places:
+1. **In `/analyze`**: if a cache hit exists, `enrichment_status` is returned as `complete` with the cached LLM fields populated. No BullMQ job is enqueued.
+2. **In the enrichment worker**: before calling the LLM API, check cache again (in case another worker already enriched this diff).
 
 Cache hit rate is expected to be low (runs are generally unique) but provides protection against:
 - Retry storms if the consumer fails and re-processes a job

@@ -183,10 +183,13 @@ Evaluates whether a specific tool use is permitted by the project's policy rules
 ```typescript
 const CheckPolicyInputSchema = z.object({
   projectSlug: z.string().min(1).max(100),
-  sessionId: z.string().min(1).describe('Claude Code session_id'),
+  sessionId: z.string().min(1).describe('Agent session ID (from hook or MCP context)'),
+  agentType: z.enum(['claude_code', 'cursor', 'copilot']).default('claude_code').describe(
+    'Which AI agent is requesting the policy check. Used for NHI (Non-Human Identity) rule matching.'
+  ),
   eventType: z.enum(['PreToolUse', 'PostToolUse', 'PermissionRequest']),
-  toolName: z.string().min(1).describe('The Claude Code tool name (e.g., "Edit", "Bash", "Write")'),
-  toolInput: z.record(z.unknown()).describe('The full tool input object from Claude Code'),
+  toolName: z.string().min(1).describe('The agent tool name (e.g., "Edit", "Bash", "Write")'),
+  toolInput: z.record(z.unknown()).describe('The full tool input object from the agent'),
   featurePackId: z.string().uuid().optional().describe(
     'If provided, also evaluate pack-specific rules in addition to project-level rules'
   ),
@@ -208,11 +211,15 @@ const CheckPolicyOutputSchema = z.object({
 **Evaluation algorithm**:
 1. Load all active policy rules for the project (ordered by `priority ASC`)
 2. If `featurePackId` provided, also load pack-specific rules
-3. For each rule (in priority order), check if `rule.event_type` matches `eventType` (or is `*`)
+3. For each rule (in priority order):
+   a. Check if `rule.agent_type` matches `agentType` (or is `*`). Skip if mismatch.
+   b. Check if `rule.event_type` matches `eventType` (or is `*`)
 4. Check if `rule.tool_pattern` matches `toolName` (glob matching with `micromatch`)
 5. Check if `rule.path_pattern` matches `tool_input.file_path` (glob matching, if applicable)
 6. First matching rule wins — return its decision
 7. Default decision if no rule matches: `allow`
+
+**Agent identity values:** `claude_code`, `cursor`, `copilot`. The `agentType` enables per-agent permission scoping as part of NHI (Non-Human Identity) infrastructure. See ADR-011 in CLAUDE.md.
 
 ---
 

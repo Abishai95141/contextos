@@ -121,3 +121,23 @@ Cache invalidation: when a policy rule is updated via the web app, a webhook hit
 Both work for ContextOS's Redis use cases. The decisive factor: BullMQ requires ioredis. Given this constraint, using ioredis everywhere (session keys, policy cache) eliminates the need for two Redis client libraries.
 
 ioredis also has a 30% lower CPU usage at load compared to node-redis (based on Ably production data), better cluster support, and built-in Sentinel support for Redis HA configurations. The TypeScript API is ergonomic and well-documented.
+
+---
+
+## 4. Multi-Agent Support: Cursor Adapter and NHI Identity
+
+### Why a stdin/stdout Adapter for Cursor (ADR-009)
+
+Claude Code hooks use HTTP POST directly to the Hooks Bridge. Cursor uses a different mechanism: command-based hooks that read JSON from stdin and write JSON to stdout. Rather than building a separate Cursor-specific bridge, ContextOS uses a **single adapter script** (`.cursor/hooks/contextos.sh`) that:
+
+1. Reads Cursor's JSON from stdin
+2. Normalizes field names (`conversation_id` → `session_id`, `tool` → `tool_name`)
+3. Injects `agent_type: "cursor"`
+4. POSTs to the same Hooks Bridge HTTP endpoint
+5. Translates the response back to Cursor's stdout format
+
+This means the Hooks Bridge itself is agent-agnostic — it receives normalized JSON regardless of which agent called it. The adapter handles the transport difference. Same semantics, different transport.
+
+### NHI Identity via `agent_type` (ADR-011)
+
+Every request to the Hooks Bridge includes an `agent_type` field: `claude_code` (default for HTTP hooks), `cursor` (injected by the adapter), or `copilot`. Policy rules use this field for **Non-Human Identity (NHI)** scoping — an organization can allow Cursor agents to run `Bash` commands but deny Claude Code agents the same permission, or vice versa. The `policy_decisions` audit table records which agent triggered each decision, enabling enterprise compliance reporting per agent identity.

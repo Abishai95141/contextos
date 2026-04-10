@@ -30,7 +30,7 @@ Update `apps/vscode/package.json` for monorepo compatibility:
 {
   "name": "contextos",
   "displayName": "ContextOS",
-  "description": "AI Agent Context Management for Claude Code",
+  "description": "AI Agent Context Management for Claude Code and Cursor",
   "version": "0.0.1",
   "publisher": "contextos-dev",
   "engines": { "vscode": "^1.96.0" },
@@ -57,6 +57,14 @@ Update `apps/vscode/package.json` for monorepo compatibility:
       {
         "command": "contextos.viewRunDetails",
         "title": "ContextOS: View Run Details"
+      },
+      {
+        "command": "contextos.configureCursorHooks",
+        "title": "ContextOS: Configure Cursor Hooks"
+      },
+      {
+        "command": "contextos.importGraphify",
+        "title": "ContextOS: Import Graphify Graph"
       }
     ],
     "configuration": {
@@ -85,6 +93,7 @@ Update `apps/vscode/package.json` for monorepo compatibility:
   "dependencies": {
     "@contextos/shared": "workspace:*",
     "better-sqlite3": "^11.8.1",
+    "sqlite-vec": "^0.1.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
@@ -255,7 +264,7 @@ export class AuthService {
 
 ---
 
-## Step 4: SQLite Cache Service
+## Step 4: SQLite Primary Store Service
 
 Create `apps/vscode/src/services/cache.ts`:
 
@@ -338,7 +347,7 @@ export class CacheService {
   constructor(storagePath: string) {
     // Ensure storage directory exists
     fs.mkdirSync(storagePath, { recursive: true });
-    const dbPath = path.join(storagePath, 'contextos-cache.db');
+    const dbPath = path.join(storagePath, 'contextos.db');
     this.db = new Database(dbPath);
     this.db.exec(SCHEMA_SQL);
     // Enable WAL mode for better concurrent read performance
@@ -621,6 +630,149 @@ async function offerHookConfiguration(
   );
 
   vscode.window.showInformationMessage('ContextOS: Claude Code hooks configured in .claude/settings.json');
+
+  // Offer Cursor hooks too
+  const cursorAnswer = await vscode.window.showInformationMessage(
+    'ContextOS: Also configure Cursor hooks?',
+    'Yes',
+    'Not now',
+  );
+
+  if (cursorAnswer === 'Yes') {
+    await configureCursorHooks(workspaceFolder, auth);
+  }
+}
+
+async function configureCursorHooks(
+  workspaceFolder: vscode.WorkspaceFolder,
+  auth: AuthService,
+): Promise<void> {
+  const token = await auth.getToken();
+  const hooksUrl = vscode.workspace.getConfiguration('contextos').get<string>('hooksUrl');
+
+  // Create .cursor/hooks directory
+  const cursorHooksDir = vscode.Uri.joinPath(workspaceFolder.uri, '.cursor', 'hooks');
+  try {
+    await vscode.workspace.fs.createDirectory(cursorHooksDir);
+  } catch { /* may already exist */ }
+
+  // Write adapter script
+  const adapterScript = `#!/usr/bin/env bash
+set -euo pipefail
+HOOK_TYPE="$1"
+INPUT=$(cat)
+NORMALIZED=$(echo "$INPUT" | jq '{
+  session_id: (.conversation_id // .session_id),
+  tool_name: (.tool // .tool_name),
+  tool_input: (.tool_input // {}),
+  cwd: (.cwd // "."),
+  agent_type: "cursor"
+}')
+RESPONSE=$(echo "$NORMALIZED" | curl -s -X POST "${hooksUrl}/hooks/$HOOK_TYPE" \\
+  -H 'Content-Type: application/json' \\
+  -H 'Authorization: Bearer ${token}' \\
+  -d @-)
+echo "$RESPONSE" | jq '{decision: .decision, message: .message}'
+`;
+
+  const scriptPath = vscode.Uri.joinPath(cursorHooksDir, 'contextos.sh');
+  await vscode.workspace.fs.writeFile(scriptPath, Buffer.from(adapterScript));
+
+  // Write .cursor/hooks.json
+  const cursorHooksConfig = {
+    hooks: {
+      'pre-command': [{ command: '.cursor/hooks/contextos.sh pre-tool-use' }],
+      'post-command': [{ command: '.cursor/hooks/contextos.sh post-tool-use' }],
+    },
+  };
+
+  const cursorConfigPath = vscode.Uri.joinPath(workspaceFolder.uri, '.cursor', 'hooks.json');
+  await vscode.workspace.fs.writeFile(
+    cursorConfigPath,
+    Buffer.from(JSON.stringify(cursorHooksConfig, null, 2)),
+  );
+
+  vscode.window.showInformationMessage('ContextOS: Cursor hooks configured in .cursor/');
+}
+
+// ── Graphify Import (Cold-Start Feature Pack Seeding) ──
+
+async function importGraphify(): Promise<void> {
+  // Step 1: Show file picker for graph.json
+  const fileUris = await vscode.window.showOpenDialog({
+    canSelectMany: false,
+    filters: { 'JSON files': ['json'] },
+    openLabel: 'Import Graphify Graph',
+  });
+  if (!fileUris || fileUris.length === 0) return;
+
+  const graphUri = fileUris[0];
+  const raw = await vscode.workspace.fs.readFile(graphUri);
+  const graphJson = JSON.parse(Buffer.from(raw).toString('utf-8'));
+
+  // Step 2: Validate graph.json structure
+  if (!Array.isArray(graphJson.nodes) || !Array.isArray(graphJson.communities)) {
+    vscode.window.showErrorMessage(
+      'Invalid graph.json: expected "nodes" and "communities" arrays. Run `graphify analyze --output graph.json .` first.',
+    );
+    return;
+  }
+
+  // Step 3: Group nodes by community ID
+  const communityMap = new Map<number, Array<{ file: string; symbol: string; type: string }>>();
+  for (const node of graphJson.nodes) {
+    const communityId = node.community_id ?? node.communityId ?? 0;
+    if (!communityMap.has(communityId)) communityMap.set(communityId, []);
+    communityMap.get(communityId)!.push({
+      file: node.file_path ?? node.filePath ?? node.file ?? 'unknown',
+      symbol: node.name ?? node.symbol ?? 'unnamed',
+      type: node.type ?? 'unknown',
+    });
+  }
+
+  // Step 4: Generate Feature Pack markdown sections
+  const communityMeta = new Map<number, string>();
+  for (const community of graphJson.communities) {
+    communityMeta.set(community.id, community.label ?? `Community ${community.id}`);
+  }
+
+  let markdown = '# Feature Pack (Draft — Generated from Graphify)\n\n';
+  markdown += '> Auto-generated by `contextos.importGraphify`. Review and edit before use.\n\n';
+
+  for (const [communityId, nodes] of communityMap) {
+    const label = communityMeta.get(communityId) ?? `Module Group ${communityId}`;
+    const uniqueFiles = [...new Set(nodes.map((n) => n.file))].sort();
+    const symbols = nodes.map((n) => `${n.symbol} (${n.type})`).slice(0, 20);
+
+    markdown += `## ${label}\n\n`;
+    markdown += `**Files (${uniqueFiles.length}):**\n`;
+    for (const f of uniqueFiles.slice(0, 30)) markdown += `- \`${f}\`\n`;
+    if (uniqueFiles.length > 30) markdown += `- ... and ${uniqueFiles.length - 30} more\n`;
+    markdown += `\n**Key symbols:**\n`;
+    for (const s of symbols) markdown += `- \`${s}\`\n`;
+    if (nodes.length > 20) markdown += `- ... and ${nodes.length - 20} more\n`;
+    markdown += `\n---\n\n`;
+  }
+
+  // Step 5: Write to .contextos/feature-pack-draft.md
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) {
+    vscode.window.showErrorMessage('No workspace folder open.');
+    return;
+  }
+
+  const draftDir = vscode.Uri.joinPath(workspaceFolder.uri, '.contextos');
+  const draftPath = vscode.Uri.joinPath(draftDir, 'feature-pack-draft.md');
+  await vscode.workspace.fs.createDirectory(draftDir);
+  await vscode.workspace.fs.writeFile(draftPath, Buffer.from(markdown));
+
+  // Step 6: Open the generated file
+  const doc = await vscode.workspace.openTextDocument(draftPath);
+  await vscode.window.showTextDocument(doc);
+
+  vscode.window.showInformationMessage(
+    `ContextOS: Imported ${graphJson.nodes.length} nodes across ${communityMap.size} communities. Review the draft Feature Pack.`,
+  );
 }
 
 function getRunDetailsHtml(runId: string, serverUrl: string, token: string): string {
@@ -748,11 +900,15 @@ describe('CacheService', () => {
 - [ ] Extension activates in VS Code without errors (check Output → ContextOS)
 - [ ] `contextos.signIn` opens a browser window
 - [ ] After sign-in, status bar updates to show org name
-- [ ] `contextos.attachPack` shows a Quick Pick with packs from cache
+- [ ] `contextos.attachPack` shows a Quick Pick with packs from local store
 - [ ] Attaching a pack writes `.contextos.json` to workspace root
-- [ ] Hook configuration offer appears after pack attachment
+- [ ] Hook configuration offer appears after pack attachment (both Claude Code and Cursor)
 - [ ] `.claude/settings.json` is created/updated with hook commands
-- [ ] `contextos.viewRunDetails` shows recent runs from cache
-- [ ] SQLite cache persists between VS Code sessions
-- [ ] Extension works in offline mode (shows cached data)
+- [ ] `.cursor/hooks.json` and `.cursor/hooks/contextos.sh` are created when Cursor hooks selected
+- [ ] `contextos.configureCursorHooks` works independently
+- [ ] `contextos.importGraphify` parses a Graphify `graph.json` and generates a draft Feature Pack
+- [ ] `contextos.viewRunDetails` shows recent runs from local store
+- [ ] SQLite primary store persists between VS Code sessions (filename: `contextos.db`)
+- [ ] Extension works fully offline (reads AND writes succeed)
+- [ ] Unsynced local writes are pushed to cloud on reconnect
 - [ ] Unit tests pass: `pnpm turbo run test:unit --filter=contextos`

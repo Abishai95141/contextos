@@ -9,17 +9,22 @@
 ## Table of Contents
 
 1. [Component Architecture](#1-component-architecture)
-2. [Request Flows — All 4 Hook Events](#2-request-flows--all-4-hook-events)
-3. [MCP Server — Tool and Resource Flows](#3-mcp-server--tool-and-resource-flows)
-4. [Embedding Pipeline Data Flow](#4-embedding-pipeline-data-flow)
-5. [Cloud Deployment Topology](#5-cloud-deployment-topology)
-6. [Database — Supabase Connection Strategy](#6-database--supabase-connection-strategy)
-7. [Redis — Upstash Configuration](#7-redis--upstash-configuration)
-8. [BullMQ Job Queues](#8-bullmq-job-queues)
-9. [Authentication and Authorization](#9-authentication-and-authorization)
-10. [Web App UX Principles](#10-web-app-ux-principles)
-11. [Failure Modes and Recovery](#11-failure-modes-and-recovery)
-12. [Service Dependency Matrix](#12-service-dependency-matrix)
+2. [Architectural Principle: Read Path vs Write Path](#2-architectural-principle-read-path-vs-write-path)
+3. [Request Flows — Hook Events (Claude Code + Cursor)](#3-request-flows--hook-events-claude-code--cursor)
+4. [MCP Server — Tool and Resource Flows](#4-mcp-server--tool-and-resource-flows)
+5. [Embedding Pipeline Data Flow](#5-embedding-pipeline-data-flow)
+6. [Local-First Architecture](#6-local-first-architecture)
+7. [Cloud Deployment Topology](#7-cloud-deployment-topology)
+8. [Database — Supabase Connection Strategy](#8-database--supabase-connection-strategy)
+9. [Redis — Upstash Configuration](#9-redis--upstash-configuration)
+10. [BullMQ Job Queues](#10-bullmq-job-queues)
+11. [Authentication and Authorization](#11-authentication-and-authorization)
+12. [Web App UX Principles](#12-web-app-ux-principles)
+13. [Failure Modes and Recovery](#13-failure-modes-and-recovery)
+14. [Service Dependency Matrix](#14-service-dependency-matrix)
+15. [Cursor Hook Adapter](#15-cursor-hook-adapter)
+16. [Graphify Integration](#16-graphify-integration)
+17. [Policy Engine as Identity Infrastructure](#17-policy-engine-as-identity-infrastructure)
 
 ---
 
@@ -27,7 +32,11 @@
 
 ### System Overview
 
-ContextOS is a cloud-hosted platform. Nothing runs on the developer's machine except the VS Code extension (a thin client) and Claude Code's hook configuration (auto-generated curl commands). All state — Feature Packs, Context Packs, policy rules, run history — lives in managed services (Supabase PostgreSQL and Upstash Redis).
+ContextOS is a **local-first platform with cloud team sync**. Each developer's machine runs a local SQLite store (with sqlite-vec for embeddings) as the primary data layer — Feature Pack caches, run events, and context packs are written locally first and synced to the cloud in the background. The cloud layer (Supabase PostgreSQL + Upstash Redis) serves as the team coordination hub: org-wide Feature Pack definitions, cross-developer context pack sharing, policy rule management, and audit trails. Developers who never enable cloud sync still get full individual functionality.
+
+The architectural split is:
+- **Hooks → write path:** recording what happened, enforcing what's allowed (Claude Code + Cursor)
+- **MCP → read path:** injecting what the agent needs to know (all agents universally)
 
 ### Full Component Diagram
 
@@ -53,12 +62,18 @@ ContextOS is a cloud-hosted platform. Nothing runs on the developer's machine ex
 │  │ VS Code Extension (@contextos/vscode)                        │            │
 │  │                                                               │            │
 │  │  - Clerk auth (browser PKCE → SecretStorage)                 │            │
-│  │  - Local SQLite cache: projects, packs, last-100 runs        │            │
+│  │  - Local SQLite + sqlite-vec: PRIMARY STORE                  │            │
+│  │    ├ Feature Pack cache (synced from cloud, used offline)    │            │
+│  │    ├ Run events (written locally, background cloud sync)     │            │
+│  │    ├ Context packs (written locally, team sync optional)     │            │
+│  │    └ Embeddings (sqlite-vec, 384-dim, local semantic search) │            │
 │  │  - Commands: signIn, attachPack, triggerRun, viewRunDetails  │            │
-│  │  - Auto-writes .claude/settings.json with hook URLs + token  │            │
+│  │  - Auto-writes hook configs:                                 │            │
+│  │    ├ .claude/settings.json (Claude Code hooks)               │            │
+│  │    └ .cursor/hooks.json (Cursor hooks)                       │            │
 │  └──────────────────────────────────────────────────────────────┘            │
 │                                                                              │
-│  Zero server-side dependencies locally. No database, no Redis.              │
+│  Local-first: works offline. Cloud sync for team features is optional.      │
 └─────────────────────────────────────────────────────────────────────────────┘
                     │ HTTPS                              │ HTTPS
                     ▼                                    ▼
@@ -180,10 +195,10 @@ ContextOS is a cloud-hosted platform. Nothing runs on the developer's machine ex
 | Service | Language | Framework | Port | Public? | Purpose |
 |---------|----------|-----------|------|---------|---------|
 | mcp-server | TypeScript | @modelcontextprotocol/sdk + Express | 3100 | Yes | MCP protocol endpoint for all AI agents |
-| hooks-bridge | TypeScript | Hono | 3101 | Yes | Claude Code lifecycle hooks + policy enforcement |
+| hooks-bridge | TypeScript | Hono | 3101 | Yes | Claude Code + Cursor lifecycle hooks + policy enforcement |
 | web | TypeScript | Next.js 15 | 3000 | Yes | Management dashboard for humans |
 | nl-assembly | Python | FastAPI | 3200 | No | Embedding generation + semantic search |
-| semantic-diff | Python | FastAPI | 3201 | No | AST parsing + LLM diff summarization |
+| semantic-diff | Python | FastAPI | 3201 | No | AST parsing + structural diff (LLM enrichment async) |
 
 ### Agent-Specific Configuration
 
@@ -231,9 +246,41 @@ Config file: `.vscode/mcp.json` (note: key is `"servers"`, not `"mcpServers"`)
 
 > VS Code Copilot has no hooks system — it relies solely on MCP tools for context injection.
 
-#### Cursor — MCP Only
+#### Cursor — Hooks + MCP
 
-Config file: `.cursor/mcp.json` (key is `"mcpServers"`)
+**Hooks** (`.cursor/hooks.json` — project-level, or `~/.cursor/hooks.json` — user-level):
+
+Cursor supports 19 hook events (richer than Claude Code's 4). All are command-based (stdin/stdout JSON). The VS Code extension auto-generates a `hooks.json` that calls a lightweight translation script, which POSTs to the hooks-bridge over HTTP.
+
+Hooks used by ContextOS:
+- `sessionStart`: fire-and-forget. Input includes `session_id`, `is_background_agent`, `composer_mode`. Returns `env` and `additional_context`.
+- `preToolUse`: synchronous governance. Input includes `tool_name`, `tool_input`, `tool_use_id`. Returns `permission` (`allow`/`deny`), `user_message`, `agent_message`, `updated_input`.
+- `postToolUse`: observational. Input includes `tool_name`, `tool_input`, `tool_output`, `duration`.
+- `beforeShellExecution`: synchronous, returns `permission`. Input includes `command`, `cwd`.
+- `beforeMCPExecution`: synchronous, returns `permission`. Input includes `tool_name`, `tool_input`.
+- `afterFileEdit`: observational. Input includes `file_path`, `edits`.
+- `sessionEnd` / `stop`: fire-and-forget. Input includes `session_id`, `reason`, `duration_ms`.
+
+Generated `.cursor/hooks.json`:
+```json
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{ "command": ".cursor/hooks/contextos.sh" }],
+    "preToolUse": [{ "command": ".cursor/hooks/contextos.sh", "matcher": "Shell|Read|Write|MCP:*" }],
+    "postToolUse": [{ "command": ".cursor/hooks/contextos.sh" }],
+    "beforeShellExecution": [{ "command": ".cursor/hooks/contextos.sh" }],
+    "beforeMCPExecution": [{ "command": ".cursor/hooks/contextos.sh", "failClosed": true }],
+    "afterFileEdit": [{ "command": ".cursor/hooks/contextos.sh" }],
+    "stop": [{ "command": ".cursor/hooks/contextos.sh" }],
+    "sessionEnd": [{ "command": ".cursor/hooks/contextos.sh" }]
+  }
+}
+```
+
+The `contextos.sh` script reads JSON from stdin, translates Cursor's hook format to the hooks-bridge HTTP format (see [Section 15: Cursor Hook Adapter](#15-cursor-hook-adapter)), POSTs to `hooks.contextos.dev`, and writes the response JSON to stdout.
+
+**MCP** (`.cursor/mcp.json` — key is `"mcpServers"`):
 ```json
 {
   "mcpServers": {
@@ -251,20 +298,60 @@ Config file: `.cursor/mcp.json` (key is `"mcpServers"`)
 
 #### Summary: What Each Agent Gets
 
-| Capability | Claude Code | VS Code + Copilot | Cursor |
-|-----------|-------------|-------------------|--------|
-| MCP tools (get_feature_pack, etc.) | ✅ via MCP | ✅ via MCP | ✅ via MCP |
-| Hook-based policy enforcement | ✅ via hooks | ❌ | ❌ |
-| Automatic context injection | ✅ via SessionStart hook | ❌ (use MCP `get_feature_pack` manually) | ❌ (use MCP `get_feature_pack` manually) |
-| Run recording & context packs | ✅ via hooks pipeline | Partial (via MCP `save_context_pack`) | Partial (via MCP `save_context_pack`) |
+| Capability | Claude Code | Cursor | VS Code + Copilot |
+|-----------|-------------|--------|-------------------|
+| MCP tools (read path: get_feature_pack, etc.) | ✅ via MCP | ✅ via MCP | ✅ via MCP |
+| Hook-based policy enforcement (write path) | ✅ 4 hooks (HTTP + command) | ✅ 19 hooks (command-based) | ❌ |
+| Automatic context injection | ✅ via SessionStart hook | ✅ via sessionStart hook | ❌ (use MCP `get_feature_pack` manually) |
+| Pre-tool governance (synchronous block/allow) | ✅ PreToolUse | ✅ preToolUse + beforeShellExecution + beforeMCPExecution | ❌ |
+| Post-tool recording | ✅ PostToolUse | ✅ postToolUse + afterFileEdit + afterMCPExecution | Partial (via MCP `save_context_pack`) |
+| Session lifecycle | ✅ SessionStart + SessionEnd | ✅ sessionStart + sessionEnd + stop | ❌ |
+| Run recording & context packs | ✅ full via hooks pipeline | ✅ full via hooks pipeline | Partial (via MCP `save_context_pack`) |
+| Subagent governance | ❌ | ✅ subagentStart + subagentStop | ❌ |
 
 The VS Code extension auto-generates the correct config file format for all three agents.
 
 ---
 
-## 2. Request Flows — All 4 Hook Events
+## 2. Architectural Principle: Read Path vs Write Path
 
-These are the exact step-by-step flows that occur when Claude Code fires each hook. Every step is numbered. Implementation must follow this sequence.
+ContextOS separates its integration surface into two orthogonal paths. This is the foundational design decision.
+
+### MCP → Read Path (Universal)
+
+MCP is supported by **every** AI coding agent: Claude Code, Cursor, Copilot, Windsurf, Cline, Codex. It is the universal mechanism for injecting context into an agent. Any tool can call `get_feature_pack` via MCP at session start regardless of whether it has hooks.
+
+The MCP server serves:
+- **Feature Packs** — what the agent needs to know before coding
+- **Context Packs** — institutional memory from previous sessions
+- **Run history** — what happened in past sessions
+- **Semantic search** — NL queries over accumulated knowledge
+
+The read path has **no latency constraint**. Agents call MCP tools when they need context, and the server responds with structured data. No policy evaluation, no event recording.
+
+### Hooks → Write Path (Claude Code + Cursor)
+
+Hooks are the governance and telemetry layer. They record what happened and enforce what's allowed. Only agents with hooks support (currently Claude Code and Cursor) participate in the write path.
+
+The hooks-bridge handles:
+- **Session lifecycle** — recording when sessions start and end, creating run records
+- **Pre-tool governance** — synchronous allow/deny decisions before tool execution (<200ms)
+- **Post-tool recording** — async event logging after tool execution
+- **Context pack assembly** — generating institutional memory from session events
+
+### Why This Split Matters
+
+1. **Adoption is not gated on hooks.** VS Code + Copilot and any future MCP-capable agent get full read access to Feature Packs and Context Packs on day one, even without hooks support.
+2. **Governance is not gated on MCP.** Policy enforcement runs in the hooks path with no MCP round-trip. The policy engine evaluates rules in-memory from a Redis-cached rule set.
+3. **The write path doesn't block the read path.** Event recording is async. Context pack assembly happens after the session ends. The MCP server serves stale-but-consistent data while the write path catches up.
+
+---
+
+## 3. Request Flows — Hook Events (Claude Code + Cursor)
+
+These are the exact step-by-step flows that occur when an agent fires each hook. Every step is numbered. Implementation must follow this sequence.
+
+> **Multi-agent note:** Claude Code and Cursor fire semantically equivalent hooks in different JSON formats. The hooks-bridge accepts both via a normalization layer (see [Section 15: Cursor Hook Adapter](#15-cursor-hook-adapter)). The flows below describe the normalized internal processing that applies to both agents.
 
 ### Hook 1: SessionStart
 
@@ -476,7 +563,7 @@ hooks-bridge receives request
 
 ---
 
-## 3. MCP Server — Tool and Resource Flows
+## 4. MCP Server — Tool and Resource Flows
 
 The MCP server speaks MCP protocol over Streamable HTTP. Agents (Claude Code, Cursor, Copilot) connect as MCP clients.
 
@@ -608,7 +695,7 @@ Input: { projectSlug: "my-app", query: "how did we implement OAuth?", limit: 5 }
 
 ---
 
-## 4. Embedding Pipeline Data Flow
+## 5. Embedding Pipeline Data Flow
 
 This is the async pipeline that runs after every session ends. It converts context pack text into a 384-dimensional vector stored in PostgreSQL for semantic search.
 
@@ -726,14 +813,82 @@ This is the async pipeline that runs after every session ends. It converts conte
 | Step | Expected Duration | Notes |
 |------|-------------------|-------|
 | Steps 1-4 (sync hook response) | < 50ms | Only DB update + Redis write + enqueue |
-| Steps 5-8 (context pack assembly) | 2-10s | Depends on semantic-diff LLM call |
-| Step 6 (semantic-diff /analyze) | 1-5s | LLM API call to Claude 3.5 Haiku |
+| Steps 5-8 (context pack assembly) | 500ms-2s | AST-only structural diff (no LLM in sync path) |
+| Step 6 (semantic-diff /analyze) | 200-500ms | tree-sitter AST parsing only; LLM enrichment is async |
 | Steps 10-13 (embedding generation) | 50-200ms | Local model inference on CPU |
-| Total time from SessionEnd → searchable | 5-15s | User never waits for this |
+| LLM summary enrichment (async, optional) | 1-5s | Background job, fires if online, not blocking |
+| Total time from SessionEnd → searchable | 2-8s | User never waits for this |
 
 ---
 
-## 5. Cloud Deployment Topology
+## 6. Local-First Architecture
+
+### Design Principle
+
+ContextOS is **local-first, cloud-synced**. Each developer's machine is self-sufficient. The cloud layer adds team coordination, not basic functionality.
+
+### On-Device (Per Developer)
+
+The VS Code extension manages a local SQLite database (via `better-sqlite3`) with `sqlite-vec` for embedding storage. This is the **primary store**, not a cache.
+
+```
+~/.contextos/
+├── contextos.db           # SQLite database (primary store)
+│   ├── feature_packs      # Synced from cloud, used offline
+│   ├── runs               # Written locally first
+│   ├── run_events         # Written locally first
+│   ├── context_packs      # Written locally, cloud sync for team sharing
+│   └── vec_context_packs  # sqlite-vec virtual table (384-dim embeddings)
+├── sync.json              # Last sync timestamp + cursor per table
+└── graphify-import/       # Cached graphify graph.json imports
+```
+
+**What happens offline:**
+- Feature Packs served from local store (last-synced version)
+- Run events written to local DB (no data loss)
+- Context packs assembled locally using AST-only structural diff (no LLM)
+- Embeddings generated locally using ONNX runtime (`all-MiniLM-L6-v2`, ~80MB model)
+- Semantic search works against locally-stored embeddings
+- Policy rules cached locally (last-synced from cloud)
+
+**What requires cloud (team features):**
+- Cross-developer context pack search ("what did the team learn about auth?")
+- Org-wide Feature Pack inheritance resolution
+- Policy rule management UI
+- Audit trail aggregation across all developers
+- Clerk authentication token refresh
+
+### Cloud (Per Team)
+
+The cloud layer (Supabase PostgreSQL + Upstash Redis) stores the **canonical team state**:
+
+| Data | Cloud Role | Local Role |
+|------|-----------|------------|
+| Feature Pack definitions | Source of truth (authored in web app) | Read-only cache, synced on connect |
+| Policy rules | Source of truth (managed in web app) | Read-only cache, synced every 60s |
+| Context packs | Team-wide searchable archive | Primary write location, background sync to cloud |
+| Run events | Aggregated audit trail | Primary write location, background sync to cloud |
+| Runs | Team dashboard visibility | Primary write location, background sync to cloud |
+| Embeddings | pgvector for cross-team search | sqlite-vec for local search |
+
+### Sync Protocol
+
+Background sync runs when the developer is online, using a simple last-write-wins strategy with server timestamps:
+
+1. **Push:** Local run events and context packs → cloud. POST to `/api/sync/push` with batch of unsync'd records. Server assigns canonical IDs and timestamps.
+2. **Pull:** Cloud Feature Packs and policy rules → local. GET from `/api/sync/pull?since={lastSync}`. Server returns records modified since last sync cursor.
+3. **Conflict resolution:** For context packs (the only entity written by multiple developers), server-side `ON CONFLICT (run_id, title) DO NOTHING` ensures idempotency. First writer wins; duplicates are discarded.
+
+### Why Local-First Eliminates Enterprise Blockers
+
+- **Privacy:** Tool inputs, outputs, and diffs never leave the developer's machine unless team sync is explicitly enabled. This eliminates the #1 enterprise evaluation blocker.
+- **Latency:** Local SQLite reads are <1ms. No network round-trip for Feature Pack lookups or policy rule evaluation.
+- **Reliability:** Hooks-bridge failures don't lose data. Events accumulate locally and sync when the service recovers.
+- **Security review:** "Data stays on your machine by default" passes most enterprise security reviews without further discussion.
+
+---
+
+## 7. Cloud Deployment Topology
 
 ### DNS and Routing
 
@@ -795,7 +950,7 @@ LOG_LEVEL               = info
 
 ---
 
-## 6. Database — Supabase Connection Strategy
+## 8. Database — Supabase Connection Strategy
 
 ### Connection Types
 
@@ -850,7 +1005,7 @@ The HNSW index in the initial migration works natively on Supabase without any s
 
 ---
 
-## 7. Redis — Upstash Configuration
+## 9. Redis — Upstash Configuration
 
 ### Why Upstash
 
@@ -893,7 +1048,7 @@ const queue = new Queue('embed-context-pack', { connection });
 
 ---
 
-## 8. BullMQ Job Queues
+## 10. BullMQ Job Queues
 
 BullMQ runs **inside existing service processes** — no additional containers. Producers and workers share the same Redis connection.
 
@@ -953,7 +1108,7 @@ const queueConfigs = {
 
 ---
 
-## 9. Authentication and Authorization
+## 11. Authentication and Authorization
 
 ### Authentication Flows
 
@@ -993,7 +1148,7 @@ Roles (managed by Clerk, NOT in our database):
 
 ---
 
-## 10. Web App UX Principles
+## 12. Web App UX Principles
 
 These are **implementation constraints**, not suggestions. They apply to every page and component.
 
@@ -1030,7 +1185,7 @@ All three visible simultaneously on desktop. Tabbed layout on mobile (< 768px).
 
 ---
 
-## 11. Failure Modes and Recovery
+## 13. Failure Modes and Recovery
 
 ### Service Failures
 
@@ -1039,7 +1194,7 @@ All three visible simultaneously on desktop. Tabbed layout on mobile (< 768px).
 | **hooks-bridge down** | Claude Code hooks get HTTP errors. Claude Code logs error and continues (non-blocking for all hooks except PreToolUse deny). No new run events recorded. | Fly.io auto-restart. Backlog builds in BullMQ — processed when service recovers. |
 | **mcp-server down** | Agents cannot fetch Feature Packs or search context. Agent LLM works without context (degraded, not broken). | Fly.io auto-restart. VS Code extension serves cached data from local SQLite. |
 | **nl-assembly down** | Embedding generation stops. Semantic search returns empty results. New context packs saved but not vectorized. | Fly.io auto-restart. `embed-context-pack` jobs retry (3x exponential). Failed jobs stay in queue — processed on recovery. |
-| **semantic-diff down** | Context packs saved without semantic diff analysis. `semantic_diff` column is NULL. | Fly.io auto-restart. `context-pack-assembly` jobs retry. Content still saved, just without LLM summary. |
+| **semantic-diff down** | Context packs saved without rich LLM-generated summaries. AST-only structural diff still runs. `semantic_diff` column contains structural data only, not LLM narrative. | Fly.io auto-restart. LLM enrichment jobs retry. Structural diff data still saved, allowing basic search. |
 | **web down** | Dashboard inaccessible. Does NOT affect Claude Code agents — they use mcp-server and hooks-bridge directly. | Fly.io auto-restart. |
 
 ### Database Failures
@@ -1065,7 +1220,7 @@ The hooks-bridge **never blocks Claude Code** on infrastructure failure. If any 
 
 ---
 
-## 12. Service Dependency Matrix
+## 14. Service Dependency Matrix
 
 Shows which managed services each container depends on and what happens when a dependency is unavailable.
 
@@ -1077,7 +1232,7 @@ mcp-server         REQUIRED    optional    REQUIRED    —            read (sear
 hooks-bridge       REQUIRED    REQUIRED    REQUIRED    —            —            —
 web                REQUIRED    —           REQUIRED    —            —            —
 nl-assembly        REQUIRED    REQUIRED    —           —            self         —
-semantic-diff      —           optional    —           REQUIRED     —            self
+semantic-diff      —           optional    —           optional     —            self
 
 REQUIRED = service cannot function without this dependency
 optional = graceful degradation (cache miss, async job delay)
@@ -1095,6 +1250,349 @@ Services can start in any order. Each service:
 
 ---
 
+## 15. Cursor Hook Adapter
+
+### Problem
+
+Claude Code hooks use HTTP endpoints (POST to `hooks.contextos.dev`). Cursor hooks are **command-based** — they spawn a process, pipe JSON to stdin, and read JSON from stdout. Same semantics, different transport.
+
+### Architecture
+
+ContextOS generates a `.cursor/hooks.json` that points every hook event at a single adapter script. The adapter script:
+
+1. Reads JSON from stdin (Cursor's hook input)
+2. Normalizes field names to match ContextOS's canonical schema
+3. POSTs the normalized payload to the hooks-bridge HTTP endpoint
+4. Reads the hooks-bridge HTTP response
+5. Translates the response back to Cursor's expected stdout JSON format
+6. Writes to stdout and exits with code 0 (success), 2 (deny), or 1 (error)
+
+```
+Cursor Agent Loop
+    │
+    ├─ preToolUse ──→ stdin JSON ──→ .cursor/hooks/contextos.sh ──→ POST /hooks/pre-tool-use
+    │                                       │                              │
+    │                                       └── stdout JSON ←── HTTP response
+    │
+    ├─ postToolUse ──→ stdin JSON ──→ .cursor/hooks/contextos.sh ──→ POST /hooks/post-tool-use
+    │
+    ├─ sessionStart ──→ stdin JSON ──→ .cursor/hooks/contextos.sh ──→ POST /hooks/session-start
+    │
+    └─ stop ──→ stdin JSON ──→ .cursor/hooks/contextos.sh ──→ POST /hooks/stop
+```
+
+### Field Normalization
+
+Cursor and Claude Code use different field names for the same concepts:
+
+| Concept | Cursor Field | Claude Code Field | Canonical (ContextOS) |
+|---------|-------------|-------------------|----------------------|
+| Session ID | `conversation_id` | `session_id` | `sessionId` |
+| Hook type | `hook_event_name` | `hook_event_name` | `hookEvent` |
+| Tool name | `tool_name` | `tool_name` | `toolName` |
+| Tool input | `tool_input` (object) | `tool_input` (string) | `toolInput` (object) |
+| Tool output | `tool_output` (string) | `tool_output` (string) | `toolOutput` (string) |
+| Agent type | `composer_mode` | N/A | `agentType` |
+| Background | `is_background_agent` | N/A | `isBackground` |
+| Model | `model` | N/A | `model` |
+
+The adapter script handles the normalization:
+
+```bash
+#!/bin/bash
+# .cursor/hooks/contextos.sh — Cursor hook adapter for ContextOS
+# Generated by the VS Code extension. Do not edit manually.
+
+set -euo pipefail
+
+HOOKS_BRIDGE_URL="${CONTEXTOS_HOOKS_URL:-http://localhost:3101}"
+INPUT=$(cat)
+
+HOOK_EVENT=$(echo "$INPUT" | jq -r '.hook_event_name')
+
+# Map Cursor hook events to ContextOS endpoints
+case "$HOOK_EVENT" in
+  sessionStart)       ENDPOINT="/hooks/session-start" ;;
+  preToolUse)         ENDPOINT="/hooks/pre-tool-use" ;;
+  postToolUse)        ENDPOINT="/hooks/post-tool-use" ;;
+  beforeShellExecution) ENDPOINT="/hooks/pre-tool-use" ;;
+  beforeMCPExecution) ENDPOINT="/hooks/pre-tool-use" ;;
+  afterShellExecution) ENDPOINT="/hooks/post-tool-use" ;;
+  afterMCPExecution)  ENDPOINT="/hooks/post-tool-use" ;;
+  afterFileEdit)      ENDPOINT="/hooks/post-tool-use" ;;
+  sessionEnd|stop)    ENDPOINT="/hooks/stop" ;;
+  *)                  exit 0 ;; # Unknown hook, pass through
+esac
+
+# Normalize: Cursor's conversation_id → ContextOS session_id
+NORMALIZED=$(echo "$INPUT" | jq '{
+  session_id: .conversation_id,
+  hook_event_name: .hook_event_name,
+  tool_name: (.tool_name // .command // null),
+  tool_input: (.tool_input // null),
+  tool_output: (.tool_output // .output // null),
+  agent_type: "cursor",
+  model: (.model // null),
+  is_background_agent: (.is_background_agent // false),
+  cursor_metadata: {
+    composer_mode: .composer_mode,
+    generation_id: .generation_id,
+    cursor_version: .cursor_version,
+    workspace_roots: .workspace_roots
+  }
+}')
+
+# POST to hooks-bridge and capture response
+HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+  -X POST "${HOOKS_BRIDGE_URL}${ENDPOINT}" \
+  -H "Content-Type: application/json" \
+  -d "$NORMALIZED" 2>/dev/null) || { exit 0; } # fail-open on network error
+
+HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -1)
+BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
+
+# Translate ContextOS response → Cursor stdout format
+if [ "$HTTP_CODE" = "200" ]; then
+  DECISION=$(echo "$BODY" | jq -r '.decision // "allow"')
+  case "$DECISION" in
+    deny)
+      echo "$BODY" | jq '{permission: "deny", user_message: (.message // "Blocked by ContextOS policy"), agent_message: (.reason // "")}'
+      exit 2
+      ;;
+    *)
+      echo "$BODY" | jq '{permission: "allow"}'
+      exit 0
+      ;;
+  esac
+else
+  exit 0 # fail-open on HTTP error
+fi
+```
+
+### Generated `.cursor/hooks.json`
+
+The VS Code extension generates this file in the project root when configuring Cursor:
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      { "command": ".cursor/hooks/contextos.sh" }
+    ],
+    "preToolUse": [
+      { "command": ".cursor/hooks/contextos.sh" }
+    ],
+    "postToolUse": [
+      { "command": ".cursor/hooks/contextos.sh" }
+    ],
+    "beforeShellExecution": [
+      { "command": ".cursor/hooks/contextos.sh" }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": ".cursor/hooks/contextos.sh",
+        "failClosed": true
+      }
+    ],
+    "afterShellExecution": [
+      { "command": ".cursor/hooks/contextos.sh" }
+    ],
+    "afterMCPExecution": [
+      { "command": ".cursor/hooks/contextos.sh" }
+    ],
+    "afterFileEdit": [
+      { "command": ".cursor/hooks/contextos.sh" }
+    ],
+    "stop": [
+      { "command": ".cursor/hooks/contextos.sh" }
+    ],
+    "sessionEnd": [
+      { "command": ".cursor/hooks/contextos.sh" }
+    ]
+  }
+}
+```
+
+**Key design decisions:**
+- `beforeMCPExecution` uses `failClosed: true` because MCP tool execution is security-critical — if the policy check fails, the tool must not run.
+- All other hooks fail-open (default) because a hooks-bridge outage should not block the developer's IDE session.
+- `preToolUse` is included alongside `beforeShellExecution`/`beforeMCPExecution` to capture generic tool events (Read, Write, Grep, Delete) that don't have dedicated `before*` hooks.
+- `afterFileEdit` maps to `post-tool-use` so the hooks-bridge can record file changes in run events.
+
+### Cursor-Specific Input Fields
+
+Cursor provides richer metadata than Claude Code on several hooks:
+
+- **`composer_mode`**: `"agent"` | `"ask"` | `"edit"` — indicates how the developer is interacting. ContextOS stores this in `cursor_metadata` for analytics but does not branch policy logic on it.
+- **`is_background_agent`**: Whether Cursor's background agent is running (vs interactive). ContextOS records this but treats background and interactive agents identically for policy enforcement.
+- **`generation_id`**: Changes with every user message within a conversation. ContextOS uses `conversation_id` (stable per session) for run correlation, not `generation_id`.
+- **`transcript_path`**: Path to Cursor's conversation transcript file. ContextOS ignores this — it maintains its own run event store.
+
+---
+
+## 16. Graphify Integration
+
+### Problem: Cold Start
+
+When ContextOS is first configured for a project, the Feature Pack is empty. The developer must manually describe what their codebase does, or the first AI coding session runs without context. This is the cold-start problem.
+
+### Solution: Import `graph.json`
+
+[Graphify](https://github.com/safishamsi/graphify) (MIT license, 19.4K stars) uses tree-sitter to parse a codebase into an AST, then applies Leiden community detection (via NetworkX) to cluster related code into "communities." Its output is a `graph.json` file and a `GRAPH_REPORT.md`.
+
+ContextOS imports graphify's output to **seed the initial Feature Pack content**:
+
+```
+Developer's project/
+├── src/                       # Developer's code
+├── .contextos/
+│   └── graphify-import/
+│       ├── graph.json         # Graphify output (nodes, edges, communities)
+│       └── GRAPH_REPORT.md    # Human-readable summary
+└── .cursor/
+    └── hooks.json             # Generated by ContextOS
+```
+
+### Import Pipeline
+
+```
+graphify build .               # Developer runs this once (or CI runs it)
+    │
+    ▼
+graph.json                     # Nodes: functions, classes, modules
+    │                          # Edges: calls, imports, inherits
+    ▼                          # Communities: Leiden-detected clusters
+contextos import-graphify      # VS Code extension command or MCP tool
+    │
+    ├─ Parse graph.json
+    │   ├─ Extract communities → Feature Pack sections
+    │   ├─ Extract node metadata → section content
+    │   └─ Extract edges → cross-references between sections
+    │
+    ├─ Generate Feature Pack content
+    │   ├─ Community 0 ("Authentication") → section: auth overview, key files, entry points
+    │   ├─ Community 1 ("Database Layer") → section: schema, migrations, query patterns
+    │   └─ Community N → section N
+    │
+    └─ Write to local SQLite → sync to cloud
+```
+
+### Mapping: Graphify → Feature Pack
+
+| Graphify Concept | Feature Pack Concept | Notes |
+|-----------------|---------------------|-------|
+| Community (Leiden cluster) | Feature Pack section | Each community becomes a named section describing that subsystem |
+| Node (function/class/module) | Section content item | Key files, functions, and classes listed in each section |
+| Edge (calls/imports/inherits) | Cross-reference | "Auth module depends on Database module" linkages |
+| `GRAPH_REPORT.md` summary | Feature Pack overview | Top-level description seeded from graphify's human-readable report |
+| Community title (auto-generated) | Section title | May need human refinement — graphify titles are algorithmic |
+
+### What Graphify Does Not Provide (And ContextOS Adds)
+
+Graphify is a **structural analysis tool**. It tells you what code exists and how it's connected. It does not tell you:
+
+- **Why** code is structured this way (architectural decisions)
+- **How** to use the code correctly (conventions, patterns)
+- **What** policies apply (file restrictions, naming rules, forbidden patterns)
+- **Who** changed what and what they learned (context packs from past runs)
+
+This is exactly ContextOS's value-add. Graphify seeds the **what**, ContextOS captures the **why/how/who** over time.
+
+### Refresh Strategy
+
+Graphify import runs:
+1. **On first setup**: `contextos import-graphify` in VS Code command palette
+2. **On CI**: `graphify build . && contextos import-graphify --ci` produces updated graph.json, ContextOS re-imports it
+3. **On-demand**: Developer runs command when codebase structure changes significantly
+
+Re-import is **additive** — new communities create new sections, modified communities update existing sections, deleted communities are soft-deleted (marked inactive). Manual edits to Feature Pack content are preserved; graphify data is stored as `source: "graphify"` and human edits as `source: "manual"`.
+
+---
+
+## 17. Policy Engine as Identity Infrastructure
+
+### The Enterprise Problem
+
+Enterprises manage human developer identities through IAM (Okta, Azure AD, Clerk). But AI coding agents are a new class of **non-human identity (NHI)** with no equivalent lifecycle management:
+
+- **No onboarding**: An agent gets full repo access the moment a developer opens their IDE.
+- **No scoped permissions**: The agent can read any file, run any command, call any API.
+- **No expiration**: Agent sessions run indefinitely with no credential rotation.
+- **No audit trail**: There's no centralized record of what agents did across the engineering org.
+
+### ContextOS as NHI Management
+
+The policy engine (`apps/hooks-bridge/src/lib/policy-engine.ts`) combined with the `policy_rules` and `policy_decisions` tables already implements the core primitives of agent identity management:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    NHI Lifecycle Mapping                     │
+├────────────────────┬────────────────────────────────────────┤
+│ NHI Concept        │ ContextOS Implementation               │
+├────────────────────┼────────────────────────────────────────┤
+│ Identity           │ {agentType, sessionId, model}          │
+│                    │ Claude Code, Cursor, Copilot each have │
+│                    │ distinct agent types in policy engine   │
+├────────────────────┼────────────────────────────────────────┤
+│ Onboarding         │ SessionStart hook: inject Feature Pack,│
+│                    │ register run, log session metadata      │
+├────────────────────┼────────────────────────────────────────┤
+│ Scoped Permissions │ policy_rules table: per-project rules  │
+│                    │ matching on toolName, path globs, and  │
+│                    │ content patterns. "deny" blocks action. │
+├────────────────────┼────────────────────────────────────────┤
+│ Activity Audit     │ policy_decisions table: every policy    │
+│                    │ evaluation logged with rule ID, input,  │
+│                    │ decision, and timestamp. Append-only.   │
+├────────────────────┼────────────────────────────────────────┤
+│ Session Expiration │ Stop hook: close run, generate context  │
+│                    │ pack, clean up session state. Idle      │
+│                    │ timeout handled by agent, not ContextOS.│
+├────────────────────┼────────────────────────────────────────┤
+│ Credential Scope   │ Clerk M2M tokens scoped per project.   │
+│                    │ Token refresh handled by VS Code ext.   │
+│                    │ No long-lived API keys.                 │
+└────────────────────┴────────────────────────────────────────┘
+```
+
+### Policy Rule Schema for NHI
+
+Policy rules already support agent identity fields:
+
+```sql
+-- From packages/db/src/schema.ts: policyRules table
+-- condition is a JSONB column with this shape:
+{
+  "toolName": "Shell",           -- which tool (or "*" for all)
+  "pathPattern": "src/auth/**",  -- file path glob
+  "contentPattern": "DROP TABLE",-- content regex
+  "agentType": "cursor",         -- which agent identity
+  "action": "deny",              -- deny | warn | log
+  "message": "Production database mutations require human approval"
+}
+```
+
+**Future NHI extensions** (not yet implemented, enterprise roadmap):
+
+| Capability | Description | Implementation |
+|-----------|-------------|----------------|
+| Agent roles | Named permission sets (e.g., "reviewer", "implementer", "ops") | New `agent_roles` table, FK from `policy_rules` |
+| Time-boxed sessions | Max session duration, mandatory breaks | Enforce in SessionStart hook via `policy_rules` time conditions |
+| Rate limiting | Max tool calls per session, per hour | BullMQ rate limiter in hooks-bridge, keyed by `{agentType, projectId}` |
+| Cross-agent isolation | Prevent agents from accessing other agents' context packs | Scope queries by `agentType` in MCP tools |
+| Compliance reporting | "What did all agents do to production code this week?" | Aggregate `policy_decisions` + `run_events` in web dashboard |
+
+### Enterprise Positioning
+
+For enterprise buyers, ContextOS is not "a context injection tool for coding agents." It is:
+
+> **Access governance for your AI workforce** — onboarding, scoped permissions, activity audit, and lifecycle management for every AI coding agent in your engineering organization.
+
+This framing maps directly to existing enterprise procurement categories (IAM, PAM, NHI management) and existing budget lines. It transforms ContextOS from a developer productivity tool (discretionary spend, bottom-up adoption) into an enterprise security platform (mandatory spend, top-down procurement).
+
+---
+
 ## Appendix: Key File Locations
 
 | Concern | File | Notes |
@@ -1109,3 +1607,9 @@ Services can start in any order. Each service:
 | Environment vars | `.env.example` | All vars documented |
 | CI pipeline | `.github/workflows/ci.yml` | 6 jobs |
 | Dockerfiles | `apps/*/Dockerfile` | Multi-stage builds with `turbo prune` |
+| Cursor hook adapter | `.cursor/hooks/contextos.sh` | Generated by VS Code ext, stdin/stdout JSON adapter |
+| Cursor hooks config | `.cursor/hooks.json` | Generated by VS Code ext, 10 hook events |
+| Claude Code hooks config | `.claude/settings.json` | Generated by VS Code ext, 4 hook events |
+| Local SQLite store | `~/.contextos/contextos.db` | Primary store for VS Code extension |
+| Graphify import cache | `.contextos/graphify-import/` | Cached graph.json + GRAPH_REPORT.md |
+| System design | `docs/SYSTEM-DESIGN.md` | This file — single architectural reference |

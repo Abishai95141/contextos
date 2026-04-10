@@ -579,6 +579,7 @@ import type { ToolContext } from '../lib/types.js';
 const inputSchema = z.object({
   projectSlug: z.string().min(1).max(100),
   sessionId: z.string().min(1),
+  agentType: z.enum(['claude_code', 'cursor', 'copilot']).default('claude_code'),
   eventType: z.enum(['PreToolUse', 'PostToolUse', 'PermissionRequest']),
   toolName: z.string().min(1),
   toolInput: z.record(z.unknown()),
@@ -596,10 +597,10 @@ export function registerCheckPolicy(server: McpServer, ctx: ToolContext): void {
       if (!parsed.success) {
         throw new McpError(ErrorCode.InvalidParams, `Invalid input: ${parsed.error.message}`);
       }
-      const { projectSlug, sessionId, eventType, toolName, toolInput, featurePackId } = parsed.data;
+      const { projectSlug, sessionId, agentType, eventType, toolName, toolInput, featurePackId } = parsed.data;
 
       logger.info(
-        { projectSlug, sessionId, eventType, toolName, orgId: authContext.orgId },
+        { projectSlug, sessionId, agentType, eventType, toolName, orgId: authContext.orgId },
         'check_policy called',
       );
 
@@ -636,6 +637,11 @@ export function registerCheckPolicy(server: McpServer, ctx: ToolContext): void {
 
       // Evaluate rules
       for (const rule of rules) {
+        // Check agent type match (NHI identity scoping)
+        if (rule.agentType !== '*' && rule.agentType !== agentType) {
+          continue;
+        }
+
         // Check event type match
         if (rule.eventType !== '*' && rule.eventType !== eventType) {
           continue;

@@ -48,9 +48,9 @@ For deeper semantic analysis (e.g., "did the behavior of function X change?"), a
 
 ---
 
-## 3. Anthropic Claude API for Summarization
+## 3. Anthropic Claude API for Async Enrichment
 
-### Why LLM for Diff Summarization
+### Why LLM Enrichment Exists (and Why It Is Async)
 
 Pure AST diff can tell you what changed syntactically. It cannot tell you:
 - Why a change was made
@@ -58,14 +58,19 @@ Pure AST diff can tell you what changed syntactically. It cannot tell you:
 - Whether a change is likely to introduce bugs
 - What architectural pattern is being applied
 
-The LLM synthesizes the raw diff and AST context into natural language that a developer can understand at a glance. This is the primary value of the Semantic Diff service.
+The LLM synthesizes the raw diff and AST context into natural language that a developer can understand at a glance.
+
+**Critically, the LLM call is NOT in the synchronous `/analyze` path.** The `/analyze` endpoint returns AST-only results in 200–500ms. LLM enrichment runs asynchronously via a BullMQ worker that calls the `/enrich` endpoint. This means:
+- The sync path never blocks on LLM latency or availability
+- If `ANTHROPIC_API_KEY` is not configured, the service operates in AST-only mode — fully functional, just without enrichment
+- LLM failures do not degrade the core diff analysis pipeline
 
 ### Why Claude (Anthropic) Over GPT-4
 
-ContextOS already requires `ANTHROPIC_API_KEY` for the Claude Code integration. Using Anthropic's API for the Semantic Diff service avoids introducing a second LLM vendor dependency.
+ContextOS uses Anthropic's API across its ecosystem. Using Anthropic's API for the Semantic Diff enrichment avoids introducing a second LLM vendor dependency. Note: `ANTHROPIC_API_KEY` is **optional** for the Semantic Diff service — the service starts and serves AST-only analysis without it.
 
 Claude Haiku (`claude-3-5-haiku-20241022`) is the correct model for this task:
-- **Speed**: Haiku is the fastest Claude model. Diff analysis is a blocking step in the context pack assembly pipeline. Low latency matters.
+- **Speed**: Haiku is the fastest Claude model. Even though enrichment is async, lower latency means enrichment results are available sooner for Context Pack assembly.
 - **Cost**: Haiku is significantly cheaper than Sonnet or Opus. Diff analysis runs on every session stop — cost efficiency is important at scale.
 - **Quality**: Haiku is more than capable for structured extraction from code diffs. The structured JSON output format constrains the task sufficiently that the full power of Opus is not needed.
 
@@ -86,36 +91,33 @@ The AST diff (structured, compact JSON) is always sent in full regardless of tok
 
 ---
 
-## 4. LLM-Generated vs. Pure AST Diff — Tradeoffs
+## 4. Two-Phase Architecture — AST-Only Sync + LLM Async Enrichment
 
-### Pure AST Diff Approach
+ContextOS uses **both** approaches as complementary phases, not competing alternatives:
 
-**Pros**:
+### Phase 1: Synchronous AST-Only Analysis (always runs)
+
 - Deterministic: same input always produces same output
-- No LLM API cost
-- No LLM API latency
-- Works offline
+- No LLM API cost or latency
+- Works offline and without `ANTHROPIC_API_KEY`
+- Returns in 200–500ms via `POST /analyze`
+- Provides: `apis_added`, `apis_removed`, `tests_added`, `tests_broken`, `new_modules`, `new_imports`
+- Output has `enrichment_status: "pending"` (or `"skipped"` if no API key)
 
-**Cons**:
-- Only syntactic information: "function X was added" not "X implements OAuth CSRF protection"
-- No business-level interpretation
-- Cannot understand the *purpose* of a change
-- Cannot identify breaking changes that aren't syntactically obvious (e.g., a behavior change inside a function)
+### Phase 2: Asynchronous LLM Enrichment (runs when available)
 
-### LLM-Augmented Approach (ContextOS's choice)
-
-**Pros**:
 - Semantic understanding: explains WHY and WHAT, not just WHAT CHANGED
 - Identifies breaking changes that AST analysis cannot detect
 - Produces human-readable summaries for Context Pack archives
 - Enables the "search context packs by natural language" use case (the summary is embedded)
+- Runs via BullMQ worker calling `POST /enrich`
+- Updates `enrichment_status` to `"complete"` (or `"failed"` on error)
 
-**Cons**:
-- API cost (mitigated by caching identical diffs)
-- API latency (mitigated by Haiku model + async processing via BullMQ worker)
-- Non-deterministic (mitigated by structured JSON output format and temperature=0 default)
-- Vendor dependency (mitigated by: Anthropic is the primary LLM partner for ContextOS anyway)
+### Why This Split
 
-**Decision**: The LLM-augmented approach is clearly better for ContextOS's use case. The Context Pack archive is a knowledge base for developers and AI agents. "Function X was added" is marginally useful; "Added CSRF-protected OAuth callback handler using state parameter validation" is genuinely useful.
+The original design had LLM analysis in the synchronous path. This was wrong for three reasons:
+1. **Latency**: LLM calls add 2–10s to every diff analysis — unacceptable for a blocking pipeline step
+2. **Availability**: If Anthropic's API is down, the entire diff pipeline fails — AST results are lost too
+3. **Enterprise deployment**: Some environments cannot send code to external LLM APIs. AST-only mode is a valid, complete operating state.
 
-The AST analysis is still performed first and included in the LLM prompt — it provides structure that makes the LLM's analysis more reliable and specific. The two approaches are complementary, not competing.
+The AST analysis is included in the LLM enrichment prompt — it provides structure that makes the LLM's analysis more reliable and specific. The two phases are complementary: AST provides the "what", LLM adds the "why".

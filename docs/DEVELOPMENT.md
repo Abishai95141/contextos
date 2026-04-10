@@ -65,7 +65,14 @@ cd services/semantic-diff
 uv sync
 cd ../..
 ```
+### VS Code Extension — Local SQLite
 
+The VS Code extension uses local SQLite (`better-sqlite3` + `sqlite-vec`) as the **primary data store**, not a cache. No manual setup is required — the extension initializes the database automatically on first launch at its global storage path.
+
+- **Database location:** `<context.globalStorageUri>/contextos.db`
+- **Dependencies:** `better-sqlite3`, `sqlite-vec` (installed via the extension's `package.json`)
+- **Sync:** Writes are recorded locally first and pushed to cloud PostgreSQL on reconnect
+- **Offline:** Extension is fully operational without network — run recording, policy checks, and semantic search all work locally
 ### 6. Verify Everything Works
 
 ```bash
@@ -398,3 +405,61 @@ Use pino-pretty for human-readable logs in development:
 ```bash
 pnpm --filter @contextos/mcp-server dev | npx pino-pretty
 ```
+
+---
+
+## Testing Agent Hooks Locally
+
+### Claude Code Hooks
+
+Claude Code hooks use HTTP POST to the Hooks Bridge. Test with curl:
+
+```bash
+# Test SessionStart hook
+echo '{"session_id":"test-123","cwd":"/app","agent_type":"claude_code"}' | \
+  curl -s -X POST http://localhost:3101/hooks/session-start \
+  -H 'Content-Type: application/json' -d @-
+
+# Test PreToolUse hook
+echo '{"session_id":"test-123","tool_name":"Write","tool_input":{"file_path":"src/index.ts"}}' | \
+  curl -s -X POST http://localhost:3101/hooks/pre-tool-use \
+  -H 'Content-Type: application/json' -d @-
+```
+
+### Cursor Hooks
+
+Cursor hooks use stdin/stdout JSON via the `contextos.sh` adapter script. Test the adapter:
+
+```bash
+# Test the adapter script directly (simulates what Cursor sends)
+echo '{"conversation_id":"cursor-test-456","tool":"Write","tool_input":{"file_path":"src/app.ts"},"cwd":"."}' | \
+  .cursor/hooks/contextos.sh pre-tool-use
+```
+
+The adapter normalizes Cursor's field names (`conversation_id` → `session_id`, `tool` → `tool_name`) and POSTs to the Hooks Bridge. Both agents hit the same backend — field normalization happens in the adapter.
+
+---
+
+## Graphify Integration (Cold-Start)
+
+For projects without existing Feature Packs, Graphify can generate initial pack content by analyzing the codebase structure.
+
+### Install Graphify
+
+```bash
+# Graphify is an external tool (safishamsi/graphify, MIT license)
+pip install graphify-cli  # or clone from GitHub
+```
+
+### Generate a Graph
+
+```bash
+# Run Graphify on your project to produce graph.json
+graphify analyze --output graph.json .
+```
+
+### Import into ContextOS
+
+Use the VS Code extension command `contextos.importGraphify` to import `graph.json`. Each Leiden community in the graph becomes a Feature Pack section with the community's files and symbols.
+
+Alternatively, the MCP server's `import_graphify` tool accepts the graph JSON directly.

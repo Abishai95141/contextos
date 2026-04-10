@@ -85,6 +85,12 @@ Pinecone, Qdrant, Weaviate, and Milvus are purpose-built for vector search at la
 
 **The migration path exists**: If ContextOS outgrows pgvector, the embedding data is already in PostgreSQL. Migrating to a dedicated vector DB is a data export + reindex operation. Starting with pgvector avoids premature infrastructure complexity.
 
+### PostgreSQL as Cloud Sync Layer (ADR-008)
+
+PostgreSQL is the **cloud sync layer**, not the only database. The VS Code extension (Feature Pack 07) uses local SQLite (`better-sqlite3` + `sqlite-vec`) as the **primary data store** on each developer's machine. Runs, run events, and context packs are written locally first — PostgreSQL receives them via background sync when connected.
+
+This means Foundation's PostgreSQL schema defines the **canonical cloud schema** that the VS Code extension syncs to/from. Feature Packs and Policy Rules flow cloud → local (read-only locally). Runs, Run Events, and Context Packs flow local → cloud (written locally first). See the VS Code Extension spec (Feature Pack 07) for the local SQLite schema and sync protocol.
+
 ---
 
 ## 4. Drizzle ORM — Why Not Prisma or Kysely?

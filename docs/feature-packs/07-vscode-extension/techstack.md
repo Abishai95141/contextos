@@ -28,16 +28,16 @@ A standalone Electron or web app would duplicate the workspace context that VS C
 
 ---
 
-## 2. better-sqlite3 for Local Cache
+## 2. better-sqlite3 + sqlite-vec for Local Primary Store
 
-### Why Local Cache
+### Why Local-First
 
-VS Code extensions run in an isolated process. Network requests to the ContextOS API are asynchronous. If every Quick Pick, command, or status bar update required an API call, the extension would feel slow and unusable offline.
+The ContextOS extension uses local SQLite as the **primary data store**, not a cache. All write operations (runs, run events, context packs) are written locally first. Cloud PostgreSQL is the team-sync layer — optional for individual developer use.
 
-The SQLite cache provides:
-- **Instant responses**: Pack list, project list, recent runs — all served from SQLite in microseconds
-- **Offline support**: Extension works without network (read-only operations)
-- **Sync in background**: API fetches happen asynchronously; UI shows cached data immediately
+This architecture solves three problems:
+- **Enterprise blocker**: Code context data never leaves the developer's machine unless they opt in to cloud sync
+- **Zero-latency reads**: Pack list, project list, recent runs, semantic search — all served from SQLite in microseconds
+- **Full offline support**: Extension is fully operational without network — not just read-only, but writes too
 
 ### Why better-sqlite3 (Not sql.js, Not @databases/sqlite)
 
@@ -49,7 +49,19 @@ The SQLite cache provides:
 
 `sql.js` is a WebAssembly port — useful for browser environments but slower than native bindings in Node.js. `@databases/sqlite` is a thin wrapper around `better-sqlite3` that adds a promise-based API — unnecessary overhead for synchronous operations.
 
-### Cache Location
+### sqlite-vec for Local Vector Search
+
+`sqlite-vec` is a SQLite extension that adds vector similarity search as a virtual table. It enables the extension to perform local semantic search over feature packs and context packs without requiring a network call to the NL Assembly service.
+
+Key properties:
+- **Single binary**: Loads as a SQLite extension — no separate process or service
+- **384-dimension vectors**: Compatible with `all-MiniLM-L6-v2` embeddings (same model used by NL Assembly)
+- **HNSW index**: Approximate nearest-neighbor search, fast enough for interactive queries
+- **Offline semantic search**: Developers can search context packs by natural language without cloud connectivity
+
+Embeddings are generated locally using ONNX Runtime with the MiniLM model. This avoids round-trips to the NL Assembly service for every search query.
+
+### Store Location
 
 The SQLite file is stored at `context.globalStorageUri.fsPath` — the VS Code-provided storage directory for the extension. This directory is:
 - Persistent across VS Code sessions
@@ -57,7 +69,7 @@ The SQLite file is stored at `context.globalStorageUri.fsPath` — the VS Code-p
 - Cleared when the extension is uninstalled
 - Located in the user's home directory, not the workspace
 
-This is the correct location for extension data that should persist globally (across workspaces) but be specific to the ContextOS extension.
+This is the correct location for extension data that should persist globally (across workspaces) but be specific to the ContextOS extension. The filename is `contextos.db` (not `contextos-cache.db` — it is the primary store, not a cache).
 
 ---
 
@@ -105,3 +117,25 @@ Tokens are stored via `context.secrets.store()`, which delegates to:
 - Linux: libsecret (GNOME Keyring or similar)
 
 The token is never written to `globalState`, `workspaceState`, or any file. It never appears in logs (all log statements use `token ? '[present]' : '[absent]'` patterns). This meets the security standard for VS Code extensions handling authentication tokens.
+
+---
+
+## 4. ONNX Runtime for Local Embedding Generation
+
+### Why Local Embeddings
+
+The NL Assembly service (Feature Pack 05) generates embeddings server-side using `sentence-transformers` with the `all-MiniLM-L6-v2` model. But the VS Code extension needs to perform semantic search **locally** — without network access — for the local-first architecture to work. ONNX Runtime enables running the same model locally in the extension's Node.js process.
+
+### Why ONNX Runtime (Not TensorFlow.js, Not WebAssembly)
+
+**`onnxruntime-node`** runs the MiniLM model natively on CPU:
+- **Same model, same output**: The `all-MiniLM-L6-v2` model is exported to ONNX format. Local embeddings are numerically identical to server-generated ones — no compatibility issues with sqlite-vec vector search.
+- **384-dimensional vectors**: Matches the NL Assembly service and pgvector schema.
+- **~50ms per embedding**: Fast enough for interactive search queries.
+- **No GPU required**: CPU inference is sufficient for single-query embedding generation.
+
+**vs. TensorFlow.js**: TF.js is heavier (~20MB+ runtime), has more complex model loading, and the ecosystem is shifting toward ONNX for inference-only workloads.
+
+**vs. calling NL Assembly**: This defeats the local-first architecture. If the network is unavailable, semantic search fails. With ONNX, search works offline.
+
+The model file (~90MB ONNX) is bundled with the extension or downloaded on first use. It is stored in the extension's global storage directory alongside the SQLite database.

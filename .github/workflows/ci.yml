@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master, main]
   pull_request:
-    branches: [main]
+    branches: [master, main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -148,7 +148,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [test-unit, test-integration, test-python]
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -195,7 +195,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [test-e2e]
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     strategy:
       matrix:
         service: [mcp-server, hooks-bridge, web]
