@@ -5,7 +5,7 @@
  * routes them to ContextOS backend services.
  */
 
-const HOOKS_BRIDGE_PORT = process.env.HOOKS_BRIDGE_PORT ?? 3101;
+import { config } from './config.js';
 
-console.log(`ContextOS Hooks Bridge — starting on port ${HOOKS_BRIDGE_PORT}`);
-console.log("Phase 2: Implement hook handlers");
+console.log(`ContextOS Hooks Bridge — starting on port ${config.HOOKS_BRIDGE_PORT}`);
+console.log('Phase 2: Implement hook handlers');

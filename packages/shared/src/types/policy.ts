@@ -3,27 +3,35 @@ export interface Policy {
   projectId: string;
   name: string;
   description?: string;
-  rules: PolicyRule[];
   isActive: boolean;
+  createdBy?: string; // Clerk user ID
   createdAt: string;
+  updatedAt: string;
 }
 
 export interface PolicyRule {
-  tool: string;
-  action: "allow" | "block" | "warn";
-  conditions?: PolicyCondition[];
-  reason: string;
-}
-
-export interface PolicyCondition {
-  field: string;
-  operator: "equals" | "contains" | "matches" | "not_equals";
-  value: string;
+  id: string;
+  policyId: string;
+  name: string;
+  eventType: 'PreToolUse' | 'PostToolUse' | 'PermissionRequest' | '*';
+  toolPattern: string; // glob, e.g. "Bash", "Write*", "*"
+  pathPattern?: string; // glob, e.g. "**/node_modules/**"
+  decision: 'allow' | 'deny' | 'warn';
+  priority: number; // lower number = higher priority
+  isActive: boolean;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
 }
 
 export interface PolicyDecision {
+  id: string;
   policyId: string;
+  ruleId?: string; // null = no rule matched (default allow)
+  runId?: string;
+  sessionId?: string;
   toolName: string;
-  decision: "allow" | "block" | "warn";
-  reason: string;
+  decision: 'allow' | 'deny' | 'warn';
+  reason?: string;
+  idempotencyKey: string;
+  evaluatedAt: string;
 }

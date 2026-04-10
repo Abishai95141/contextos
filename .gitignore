@@ -26,3 +26,6 @@ coverage/
 
 # Turbo
 .turbo/
+
+# Stray cloned directories (e.g. from accidental `git clone https://...` in project root)
+https:/

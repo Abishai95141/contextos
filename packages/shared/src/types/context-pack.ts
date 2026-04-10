@@ -8,7 +8,7 @@ export interface ContextPack {
   content: ContextPackContent;
   semanticDiff?: SemanticDiff;
   summary?: string;
-  status: "committed" | "partial" | "quarantined";
+  status: 'committed' | 'partial' | 'quarantined';
   agentName?: string;
   createdAt: string;
 }
@@ -46,6 +46,6 @@ export interface SemanticDiff {
 
 export interface TestResult {
   name: string;
-  status: "passed" | "failed" | "skipped";
+  status: 'passed' | 'failed' | 'skipped';
   duration?: number;
 }

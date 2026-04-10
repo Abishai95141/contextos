@@ -12,6 +12,9 @@
     "test:unit": "vitest run --reporter=verbose __tests__/unit",
     "test:integration": "vitest run --reporter=verbose __tests__/integration"
   },
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
   "devDependencies": {
     "@vitest/coverage-v8": "^2.1.0",
     "typescript": "^5.7.0",

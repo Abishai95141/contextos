@@ -14,11 +14,9 @@ export interface PostToolUseInput {
   durationMs: number;
 }
 
-export async function handlePostToolUse(
-  _input: PostToolUseInput,
-): Promise<void> {
+export async function handlePostToolUse(_input: PostToolUseInput): Promise<void> {
   // TODO: Implement in Phase 2
   // 1. Generate idempotency key
   // 2. Append to run_events (non-blocking)
-  throw new Error("Not implemented — Phase 2");
+  throw new Error('Not implemented — Phase 2');
 }

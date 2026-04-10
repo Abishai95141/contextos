@@ -5,19 +5,26 @@
  * Server-side, isolated from pack contents.
  */
 
-import type { PolicyDecision, PolicyRule } from "@contextos/shared";
+import { randomUUID } from 'node:crypto';
+import type { PolicyDecision, PolicyRule } from '@contextos/shared';
+import { generatePolicyDecisionKey } from '@contextos/shared';
 
 export function evaluatePolicy(
   _rules: PolicyRule[],
-  _toolName: string,
+  toolName: string,
   _toolParams: Record<string, unknown>,
+  sessionId: string,
+  eventType: string,
+  policyId: string,
 ): PolicyDecision {
-  // TODO: Implement in Phase 2
-  // Default: allow everything
+  // TODO: Implement in Phase 2 — glob-match rules by priority
   return {
-    policyId: "default",
-    toolName: _toolName,
-    decision: "allow",
-    reason: "No policies configured — default allow",
+    id: randomUUID(),
+    policyId,
+    toolName,
+    decision: 'allow',
+    reason: 'No policies configured — default allow',
+    idempotencyKey: generatePolicyDecisionKey(sessionId, toolName, eventType),
+    evaluatedAt: new Date().toISOString(),
   };
 }

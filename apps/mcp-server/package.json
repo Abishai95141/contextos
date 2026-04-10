@@ -16,10 +16,18 @@
   },
   "dependencies": {
     "@contextos/shared": "workspace:*",
-    "@contextos/db": "workspace:*"
+    "@contextos/db": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@clerk/backend": "^1.0.0",
+    "express": "^4.21.0",
+    "ioredis": "^5.3.0",
+    "pino": "^9.0.0",
+    "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@types/express": "^4.17.0",
     "@vitest/coverage-v8": "^2.1.0",
+    "pino-pretty": "^13.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^2.1.0"

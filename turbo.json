@@ -17,6 +17,7 @@
     },
     "test:unit": {
       "dependsOn": ["build"],
+      "cache": false,
       "outputs": ["coverage/**"]
     },
     "test:integration": {

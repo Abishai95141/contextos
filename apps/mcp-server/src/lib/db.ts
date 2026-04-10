@@ -1,14 +1,9 @@
 /**
  * Database connection for MCP Server.
- * Uses @contextos/db for schema definitions.
+ * Uses createDb factory from @contextos/db.
  */
 
-// TODO: Initialize drizzle-orm connection
-// import { drizzle } from "drizzle-orm/postgres-js";
-// import postgres from "postgres";
-// import * as schema from "@contextos/db";
+import { createDb } from '@contextos/db';
+import { config } from '../config.js';
 
-export function getDb() {
-  // TODO: Implement in Phase 1
-  throw new Error("Database connection not configured — Phase 1");
-}
+export const db = createDb(config.DATABASE_URL);

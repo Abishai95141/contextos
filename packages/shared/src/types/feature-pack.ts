@@ -2,12 +2,16 @@ export interface FeaturePack {
   id: string;
   projectId: string;
   name: string;
+  slug: string;
   version: number;
   parentPackId?: string;
   content: FeaturePackContent;
   sourceFiles?: string[];
+  isActive: boolean;
   isStale: boolean;
+  createdBy?: string; // Clerk user ID
   createdAt: string;
+  updatedAt: string;
 }
 
 export interface FeaturePackContent {
@@ -23,7 +27,7 @@ export interface FeaturePackContent {
 export interface ArchitectureDecisionRecord {
   id: string;
   title: string;
-  status: "accepted" | "deprecated" | "superseded";
+  status: 'accepted' | 'deprecated' | 'superseded';
   context: string;
   decision: string;
   consequences: string;

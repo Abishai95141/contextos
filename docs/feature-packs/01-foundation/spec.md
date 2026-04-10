@@ -250,25 +250,9 @@ CREATE TABLE semantic_diffs (
 CREATE INDEX semantic_diffs_run_id_idx ON semantic_diffs (run_id);
 ```
 
-### Table 8: `pack_embeddings_queue`
+### Table 8: ~~`pack_embeddings_queue`~~ — REMOVED
 
-Tracks embedding generation jobs so the NL Assembly service can process them asynchronously and avoid reprocessing.
-
-```sql
-CREATE TABLE pack_embeddings_queue (
-  id              BIGSERIAL PRIMARY KEY,
-  context_pack_id UUID NOT NULL REFERENCES context_packs(id) ON DELETE CASCADE,
-  status          TEXT NOT NULL DEFAULT 'pending'
-                  CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
-  attempts        INTEGER NOT NULL DEFAULT 0,
-  last_error      TEXT,
-  enqueued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-  processed_at    TIMESTAMPTZ
-);
-CREATE INDEX pack_embeddings_queue_status_idx ON pack_embeddings_queue (status)
-  WHERE status IN ('pending', 'failed');
-CREATE INDEX pack_embeddings_queue_context_pack_id_idx ON pack_embeddings_queue (context_pack_id);
-```
+> **Architecture note:** Embedding generation jobs are queued via **BullMQ + Redis** (ADR-006), not a database table. The NL Assembly service consumes jobs from the `embed-context-pack` BullMQ queue. No database table is required for this.
 
 ---
 
@@ -314,21 +298,21 @@ NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
 CLERK_WEBHOOK_SECRET=whsec_...
 
 # NL Assembly Service
-NL_ASSEMBLY_URL=http://localhost:8001
+NL_ASSEMBLY_URL=http://localhost:3200
 NL_ASSEMBLY_EMBEDDING_MODEL=all-MiniLM-L6-v2
 
 # Semantic Diff Service
-SEMANTIC_DIFF_URL=http://localhost:8002
+SEMANTIC_DIFF_URL=http://localhost:3201
 ANTHROPIC_API_KEY=sk-ant-...
 SEMANTIC_DIFF_MODEL=claude-3-5-haiku-20241022
 
 # MCP Server
-MCP_SERVER_PORT=3000
-MCP_SERVER_BASE_URL=http://localhost:3000
+MCP_SERVER_PORT=3100
+MCP_SERVER_BASE_URL=http://localhost:3100
 
 # Hooks Bridge
-HOOKS_BRIDGE_PORT=3001
-HOOKS_BRIDGE_BASE_URL=http://localhost:3001
+HOOKS_BRIDGE_PORT=3101
+HOOKS_BRIDGE_BASE_URL=http://localhost:3101
 
 # Web App
 NEXT_PUBLIC_APP_URL=http://localhost:3002
@@ -355,8 +339,8 @@ export const EnvSchema = z.object({
   SEMANTIC_DIFF_URL: z.string().url(),
   ANTHROPIC_API_KEY: z.string().min(1),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
-  MCP_SERVER_PORT: z.coerce.number().int().positive().default(3000),
-  HOOKS_BRIDGE_PORT: z.coerce.number().int().positive().default(3001),
+  MCP_SERVER_PORT: z.coerce.number().int().positive().default(3100),
+  HOOKS_BRIDGE_PORT: z.coerce.number().int().positive().default(3101),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

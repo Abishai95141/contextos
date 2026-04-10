@@ -13,16 +13,14 @@ export interface PreToolUseInput {
 }
 
 export type PreToolUseResult =
-  | { action: "allow" }
-  | { action: "block"; reason: string }
-  | { action: "warn"; message: string };
+  | { action: 'allow' }
+  | { action: 'block'; reason: string }
+  | { action: 'warn'; message: string };
 
-export async function handlePreToolUse(
-  _input: PreToolUseInput,
-): Promise<PreToolUseResult> {
+export async function handlePreToolUse(_input: PreToolUseInput): Promise<PreToolUseResult> {
   // TODO: Implement in Phase 2
   // 1. Call Policy Engine
   // 2. Log decision to policy_decisions table
   // 3. Return result
-  throw new Error("Not implemented — Phase 2");
+  throw new Error('Not implemented — Phase 2');
 }

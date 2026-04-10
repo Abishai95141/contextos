@@ -78,9 +78,9 @@ describe('Handler module exports', () => {
     expect(typeof mod.handlePostToolUse).toBe('function');
   });
 
-  it('stop exports handleStop', async () => {
-    const mod = await import('../../src/handlers/stop.js');
-    expect(typeof mod.handleStop).toBe('function');
+  it('session-end exports handleSessionEnd', async () => {
+    const mod = await import('../../src/handlers/session-end.js');
+    expect(typeof mod.handleSessionEnd).toBe('function');
   });
 });
 
@@ -89,7 +89,7 @@ describe('Handler module exports', () => {
 // ---------------------------------------------------------------------------
 
 describe('Hook lifecycle simulation', () => {
-  it('SessionStart → PreToolUse → PostToolUse → Stop (stub chain)', async () => {
+  it('SessionStart → PreToolUse → PostToolUse → SessionEnd (stub chain)', async () => {
     // Simulate a full developer session using stub implementations
     type SessionCtx = { sessionId: string; runId: string; toolsUsed: string[] };
     const ctx: SessionCtx = { sessionId: 'ses-lifecycle-1', runId: 'run-lifecycle-1', toolsUsed: [] };
@@ -118,9 +118,9 @@ describe('Hook lifecycle simulation', () => {
     }));
     expect(postToolResults).toHaveLength(tools.length);
 
-    // 4. Stop: commit context pack
-    const stopResult = { committed: true, contextPackId: 'cp-lifecycle-1' };
-    expect(stopResult.committed).toBe(true);
+    // 4. SessionEnd: commit context pack
+    const sessionEndResult = { committed: true, contextPackId: 'cp-lifecycle-1' };
+    expect(sessionEndResult.committed).toBe(true);
   });
 
   it('blocked tool does not advance to PostToolUse', async () => {

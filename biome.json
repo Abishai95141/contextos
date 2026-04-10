@@ -15,7 +15,13 @@
       "style": { "noNonNullAssertion": "off" }
     }
   },
-  "organizeImports": { "enabled": true },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  },
   "javascript": {
     "formatter": { "quoteStyle": "single", "trailingCommas": "all" }
   }

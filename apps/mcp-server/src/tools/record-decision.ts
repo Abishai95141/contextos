@@ -12,9 +12,7 @@ export interface RecordDecisionInput {
   alternatives?: string[];
 }
 
-export async function recordDecision(
-  _input: RecordDecisionInput,
-): Promise<{ recorded: boolean }> {
+export async function recordDecision(_input: RecordDecisionInput): Promise<{ recorded: boolean }> {
   // TODO: Implement in Phase 1
-  throw new Error("Not implemented — Phase 1");
+  throw new Error('Not implemented — Phase 1');
 }

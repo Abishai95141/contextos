@@ -20,7 +20,7 @@ Claude Code (running locally)
 │  POST /hooks/session-start                           │
 │  POST /hooks/pre-tool-use                            │
 │  POST /hooks/post-tool-use                           │
-│  POST /hooks/stop                                    │
+│  POST /hooks/session-end                             │
 │                                                      │
 │  ┌──────────────────────────────────────────────┐    │
 │  │              Hook Handlers                   │    │
@@ -31,7 +31,7 @@ Claude Code (running locally)
 │  │  │              → return allow/deny       │  │    │
 │  │  │ PostToolUse → record outcome (async)   │  │    │
 │  │  │              → update event record     │  │    │
-│  │  │ Stop        → finalize run             │  │    │
+│  │  │ SessionEnd  → finalize run             │  │    │
 │  │  │              → trigger context pack    │  │    │
 │  │  └────────────────────────────────────────┘  │    │
 │  └──────────────────────────────────────────────┘    │
@@ -121,6 +121,7 @@ Claude Code calls hooks as HTTP POST requests. The Hooks Bridge must respond wit
 ```json
 {
   "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
     "permissionDecision": "allow"
   }
 }
@@ -130,11 +131,14 @@ Claude Code calls hooks as HTTP POST requests. The Hooks Bridge must respond wit
 ```json
 {
   "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
     "permissionDecisionReason": "Policy violation: editing /etc/ is not allowed"
   }
 }
 ```
+
+> **Note:** The `hookEventName` field is REQUIRED inside `hookSpecificOutput`. Claude Code uses it to identify which event the response belongs to.
 
 **Actions**:
 1. Parse payload
@@ -182,25 +186,29 @@ Claude Code calls hooks as HTTP POST requests. The Hooks Bridge must respond wit
 
 ---
 
-### Hook 4: `Stop`
+### Hook 4: `SessionEnd`
 
-**URL**: `POST /hooks/stop`
+**URL**: `POST /hooks/session-end`
+
+> **Why SessionEnd, not Stop?** Claude Code's `Stop` event fires every time Claude finishes responding (after each turn). `SessionEnd` fires once when the session actually terminates. Our run-finalization logic must use `SessionEnd`.
 
 **Claude Code sends**:
 ```json
 {
   "session_id": "abc123-session-uuid",
-  "hook_event_name": "Stop",
-  "cwd": "/home/user/projects/myapp"
+  "hook_event_name": "SessionEnd",
+  "cwd": "/home/user/projects/myapp",
+  "reason": "other"
 }
 ```
 
 **Hooks Bridge response** (200 OK):
 ```json
-{
-  "continue": true
-}
+{}
 ```
+
+> SessionEnd has no decision control — it cannot block session termination. Return empty 200 or any 2xx.
+> Default timeout is 1.5s (configurable via `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS`). Our handler targets <50ms.
 
 **Actions**:
 1. Parse payload
@@ -216,25 +224,41 @@ Claude Code calls hooks as HTTP POST requests. The Hooks Bridge must respond wit
 
 ### Claude Code Hook Format
 
-Claude Code expects:
-- HTTP `2xx` response within 10 seconds (else timeout error, non-blocking)
-- `Content-Type: application/json`
-- For `PreToolUse` blocking: `{ hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: string } }`
-- For all others (non-blocking): `{ continue: true }` or any 2xx
+Claude Code hooks come in four types: `command`, `http`, `prompt`, `agent`. ContextOS uses:
+- **SessionStart**: `type: "command"` (the only type SessionStart supports) — a curl command that POSTs stdin to our endpoint
+- **PreToolUse, PostToolUse**: `type: "http"` — Claude Code sends HTTP POST directly
+- **SessionEnd**: `type: "http"` — Claude Code sends HTTP POST directly
+
+Response handling:
+- **HTTP hooks**: 2xx with JSON body parsed for decision control. Non-2xx = non-blocking error. Connection failure = non-blocking error.
+- **To deny a PreToolUse**: Return 2xx with `{ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: string } }`
+- **PostToolUse blocking (optional)**: Uses top-level `{ decision: "block", reason: string }` — NOT hookSpecificOutput
+- **SessionEnd**: Has no decision control. Any 2xx response (including empty body) is fine.
+- **SessionStart**: stdout text is added to Claude's context. JSON `hookSpecificOutput.additionalContext` also works.
 
 The Hooks Bridge must never block Claude Code's main thread. Policy evaluation must complete in under 500ms. If policy evaluation times out, default to `allow` and log the timeout.
 
 ### Internal Response Type
 
 ```typescript
-type HookResponse =
-  | { continue: true }
-  | {
-      hookSpecificOutput: {
-        permissionDecision: 'allow' | 'deny';
-        permissionDecisionReason?: string;
-      };
-    };
+type PreToolUseResponse = {
+  hookSpecificOutput: {
+    hookEventName: 'PreToolUse';
+    permissionDecision: 'allow' | 'deny';
+    permissionDecisionReason?: string;
+  };
+};
+
+type PostToolUseResponse = {} | { decision: 'block'; reason: string };
+
+type SessionEndResponse = {};
+
+type SessionStartResponse = {} | {
+  hookSpecificOutput: {
+    hookEventName: 'SessionStart';
+    additionalContext?: string;
+  };
+};
 ```
 
 ---
@@ -301,10 +325,10 @@ The Run Recorder is responsible for writing hook events to `run_events` reliably
 {sessionId}:{hook_event_name}:{tool_use_id}
 ```
 
-For `SessionStart` and `Stop` (no tool_use_id):
+For `SessionStart` and `SessionEnd` (no tool_use_id):
 ```
 {sessionId}:SessionStart:start
-{sessionId}:Stop:stop
+{sessionId}:SessionEnd:end
 ```
 
 ### Event Recording Flow
@@ -322,9 +346,9 @@ For `SessionStart` and `Stop` (no tool_use_id):
 
 ---
 
-## 6. Context Pack Assembly on Stop
+## 6. Context Pack Assembly on SessionEnd
 
-When the `Stop` hook fires, the Hooks Bridge enqueues a `context-pack-assembly` BullMQ job. The worker:
+When the `SessionEnd` hook fires, the Hooks Bridge enqueues a `context-pack-assembly` BullMQ job. The worker:
 
 1. Loads all `run_events` for the run
 2. Extracts file paths edited (from `PreToolUse` events with `tool_name = 'Edit'`)
@@ -355,33 +379,63 @@ When the `Stop` hook fires, the Hooks Bridge enqueues a `context-pack-assembly` 
 
 ## 7. Auto-Configuration of `.claude/settings.json`
 
-When a user registers a project with ContextOS (via the web app or VS Code extension), the Hooks Bridge URL is auto-written to the project's `.claude/settings.json`:
+When a user registers a project with ContextOS (via the web app or VS Code extension), the Hooks Bridge URL is auto-written to the project's `.claude/settings.json`.
+
+> **Hook type constraints:** SessionStart only supports `type: "command"` hooks. PreToolUse, PostToolUse, and SessionEnd support `type: "http"` (preferred for cleaner config and native error handling).
 
 ```json
 {
   "hooks": {
     "SessionStart": [
       {
-        "type": "command",
-        "command": "curl -s -X POST https://hooks.contextos.dev/hooks/session-start -H 'Content-Type: application/json' -H 'Authorization: Bearer $CONTEXTOS_TOKEN' -d @-"
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -X POST https://hooks.contextos.dev/hooks/session-start -H 'Content-Type: application/json' -H 'Authorization: Bearer $CONTEXTOS_TOKEN' -d @-"
+          }
+        ]
       }
     ],
     "PreToolUse": [
       {
-        "type": "command",
-        "command": "curl -s -X POST https://hooks.contextos.dev/hooks/pre-tool-use -H 'Content-Type: application/json' -H 'Authorization: Bearer $CONTEXTOS_TOKEN' -d @-"
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://hooks.contextos.dev/hooks/pre-tool-use",
+            "headers": {
+              "Authorization": "Bearer $CONTEXTOS_TOKEN"
+            },
+            "allowedEnvVars": ["CONTEXTOS_TOKEN"]
+          }
+        ]
       }
     ],
     "PostToolUse": [
       {
-        "type": "command",
-        "command": "curl -s -X POST https://hooks.contextos.dev/hooks/post-tool-use -H 'Content-Type: application/json' -H 'Authorization: Bearer $CONTEXTOS_TOKEN' -d @-"
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://hooks.contextos.dev/hooks/post-tool-use",
+            "headers": {
+              "Authorization": "Bearer $CONTEXTOS_TOKEN"
+            },
+            "allowedEnvVars": ["CONTEXTOS_TOKEN"]
+          }
+        ]
       }
     ],
-    "Stop": [
+    "SessionEnd": [
       {
-        "type": "command",
-        "command": "curl -s -X POST https://hooks.contextos.dev/hooks/stop -H 'Content-Type: application/json' -H 'Authorization: Bearer $CONTEXTOS_TOKEN' -d @-"
+        "hooks": [
+          {
+            "type": "http",
+            "url": "https://hooks.contextos.dev/hooks/session-end",
+            "headers": {
+              "Authorization": "Bearer $CONTEXTOS_TOKEN"
+            },
+            "allowedEnvVars": ["CONTEXTOS_TOKEN"]
+          }
+        ]
       }
     ]
   }

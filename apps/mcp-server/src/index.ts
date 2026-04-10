@@ -16,4 +16,4 @@
 const MCP_SERVER_PORT = process.env.MCP_SERVER_PORT ?? 3100;
 
 console.log(`ContextOS MCP Server — starting on port ${MCP_SERVER_PORT}`);
-console.log("Phase 1: Implement MCP tools and resources");
+console.log('Phase 1: Implement MCP tools and resources');

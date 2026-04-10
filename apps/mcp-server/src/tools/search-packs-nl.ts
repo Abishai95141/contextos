@@ -5,7 +5,7 @@
  * Returns relevant prior packs for a described task.
  */
 
-import type { ContextPack } from "@contextos/shared";
+import type { ContextPack } from '@contextos/shared';
 
 export interface SearchPacksNlInput {
   projectId: string;
@@ -20,13 +20,11 @@ export interface SearchPacksNlOutput {
   }>;
 }
 
-export async function searchPacksNl(
-  _input: SearchPacksNlInput,
-): Promise<SearchPacksNlOutput> {
+export async function searchPacksNl(_input: SearchPacksNlInput): Promise<SearchPacksNlOutput> {
   // TODO: Implement in Phase 1
   // 1. Generate embedding for query
   // 2. pgvector cosine similarity search
   // 3. Filter by project (tenant isolation)
   // 4. Return ranked results
-  throw new Error("Not implemented — Phase 1");
+  throw new Error('Not implemented — Phase 1');
 }

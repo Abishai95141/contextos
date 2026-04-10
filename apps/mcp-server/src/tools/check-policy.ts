@@ -5,7 +5,7 @@
  * Returns allow/block/warn with reason.
  */
 
-import type { PolicyDecision } from "@contextos/shared";
+import type { PolicyDecision } from '@contextos/shared';
 
 export interface CheckPolicyInput {
   projectId: string;
@@ -13,12 +13,10 @@ export interface CheckPolicyInput {
   toolParams?: Record<string, unknown>;
 }
 
-export async function checkPolicy(
-  _input: CheckPolicyInput,
-): Promise<PolicyDecision> {
+export async function checkPolicy(_input: CheckPolicyInput): Promise<PolicyDecision> {
   // TODO: Implement in Phase 1
   // 1. Load active policies for project
   // 2. Evaluate each rule against tool name and params
   // 3. Return first blocking rule, or allow
-  throw new Error("Not implemented — Phase 1");
+  throw new Error('Not implemented — Phase 1');
 }
